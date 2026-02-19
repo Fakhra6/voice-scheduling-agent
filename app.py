@@ -117,27 +117,19 @@ def home():
     return "Voice Scheduling Agent is running!"
 
 
+from flask import Flask, request, jsonify, Response
+import json
+
 @app.route('/chat/completions', methods=['POST'])
 def chat():
-    """
-    Custom LLM endpoint that Vapi calls for every conversation turn.
-    Why: By intercepting here we can inject today's date and current time
-    into the system prompt dynamically before forwarding to Groq.
-    Vapi expects an OpenAI-compatible response format.
-    """
     try:
         data = request.json
-
-        # Extract conversation history from Vapi's request
         messages = data.get('messages', [])
+        stream = data.get('stream', False)
 
-        # Remove any system message Vapi sends — we replace with ours
         messages = [m for m in messages if m.get('role') != 'system']
-
-        # Inject our dynamic system prompt with today's date and time
         messages = [{'role': 'system', 'content': get_system_prompt()}] + messages
 
-        # Define the calendar tool so Groq knows when and how to call it
         tools = [
             {
                 "type": "function",
@@ -166,52 +158,127 @@ def chat():
             }
         ]
 
-        # Forward to Groq
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            temperature=0.3,  # Low temp = consistent, predictable behavior
-            max_tokens=1000
-        )
+        if stream:
+            # Streaming response for Vapi
+            def generate():
+                response = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    temperature=0.3,
+                    max_tokens=1000,
+                    stream=True
+                )
 
-        choice = response.choices[0]
-        message = choice.message
+                for chunk in response:
+                    if chunk.choices[0].delta.content:
+                        data = {
+                            "id": chunk.id,
+                            "object": "chat.completion.chunk",
+                            "created": int(datetime.now().timestamp()),
+                            "model": "llama-3.3-70b-versatile",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "content": chunk.choices[0].delta.content
+                                    },
+                                    "finish_reason": None
+                                }
+                            ]
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
 
-        # Build tool_calls in OpenAI format if present
-        tool_calls = None
-        if message.tool_calls:
-            tool_calls = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
+                    elif chunk.choices[0].finish_reason:
+                        # Handle tool calls in streaming
+                        tool_calls = None
+                        if hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
+                            tool_calls = [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments
+                                    }
+                                }
+                                for tc in chunk.choices[0].delta.tool_calls
+                            ]
+
+                        done_data = {
+                            "id": chunk.id,
+                            "object": "chat.completion.chunk",
+                            "created": int(datetime.now().timestamp()),
+                            "model": "llama-3.3-70b-versatile",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": chunk.choices[0].finish_reason,
+                                    "tool_calls": tool_calls
+                                }
+                            ]
+                        }
+                        yield f"data: {json.dumps(done_data)}\n\n"
+
+                yield "data: [DONE]\n\n"
+
+            return Response(
+                generate(),
+                mimetype='text/event-stream',
+                headers={
+                    'Cache-Control': 'no-cache',
+                    'X-Accel-Buffering': 'no'
+                }
+            )
+
+        else:
+            # Non-streaming response (fallback)
+            response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.3,
+                max_tokens=1000
+            )
+
+            choice = response.choices[0]
+            message = choice.message
+
+            tool_calls = None
+            if message.tool_calls:
+                tool_calls = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
                     }
-                }
-                for tc in message.tool_calls
-            ]
+                    for tc in message.tool_calls
+                ]
 
-        # Return in OpenAI-compatible format that Vapi expects
-        return jsonify({
-            "id": response.id,
-            "object": "chat.completion",
-            "created": int(datetime.now().timestamp()),
-            "model": response.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": message.content or "",
-                        "tool_calls": tool_calls
-                    },
-                    "finish_reason": choice.finish_reason
-                }
-            ]
-        })
+            return jsonify({
+                "id": response.id,
+                "object": "chat.completion",
+                "created": int(datetime.now().timestamp()),
+                "model": response.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": message.content or "",
+                            "tool_calls": tool_calls
+                        },
+                        "finish_reason": choice.finish_reason
+                    }
+                ]
+            })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
