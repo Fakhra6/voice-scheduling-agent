@@ -105,7 +105,7 @@ def home():
     return "Voice Scheduling Agent is running!"
 
 
-@app.route('/chat', methods=['POST'])
+@app.route('/chat/completions', methods=['POST'])
 def chat():
     """
     Custom LLM endpoint that Vapi calls for every conversation turn.
