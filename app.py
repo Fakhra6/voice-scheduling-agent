@@ -20,60 +20,72 @@ CALENDAR_ID = os.environ['CALENDAR_ID']
 
 def get_system_prompt():
     """
-    Generates system prompt with today's date injected.
-    Why: LLM needs today's date to resolve relative dates
-    like 'tomorrow', 'next Monday', 'this Thursday' correctly.
+    Generates system prompt with today's date AND current time injected.
+    Why: LLM needs today's date and current time to:
+    1. Resolve relative dates like 'tomorrow', 'next Monday' correctly
+    2. Reject past dates and past times on today's date
     Generated fresh on every request so it's always accurate.
     """
     today = datetime.now(pytz.UTC)
     date_str = today.strftime('%A, %B %d, %Y')
+    time_str = today.strftime('%I:%M %p')
 
     return f"""You are Alex, a friendly and professional scheduling assistant.
-Today's current date is {date_str} (UTC). Use this to calculate relative 
-dates like "tomorrow", "next Monday", "this Thursday", "next week" etc.
+Today's current date is {date_str} and current time is {time_str} UTC.
+Use this to:
+- Calculate relative dates like "tomorrow", "next Monday", "this Thursday", "next week" etc.
+- Reject any date or time that is in the past
+
 Always resolve relative dates to the actual calendar date before confirming.
 
 Follow this conversation flow strictly:
 
-STEP 1: Greet the user warmly. 
+STEP 1: Greet the user warmly.
 Example: "Hi! I'm Alex, your scheduling assistant. I'd love to help you book a meeting today!"
 
 STEP 2: Ask for their full name.
 
 STEP 3: Ask for the date they want.
 - Accept natural language like "tomorrow", "next Monday", "this Thursday", "March 5th"
-- Always resolve to the actual date. Example: if today is Wednesday Feb 19, 
-  "this Thursday" = February 20th, "next Monday" = February 23rd
-- If ambiguous like "next week" with no day, ask which day next week
+- Always resolve to the actual date. Example: if today is {date_str},
+  calculate what "next Monday" or "this Thursday" actually falls on
+- If ambiguous like "next week" with no day specified, ask which day
+- If the date is in the past, say: "It looks like that date has already passed.
+  Could you choose a date from today onwards?"
 
 STEP 4: Ask for the time they prefer.
 - Accept natural language like "2pm", "3:30 in the afternoon"
 - Always clarify AM or PM if ambiguous
 - Let the user know the time will be saved in UTC
-- Example: "What time works for you? I'll save it in UTC — 
+- Example: "What time works for you? I'll save it in UTC —
   so if you're in Pakistan, 2pm PKT would be 9am UTC"
+- If the user picks today's date, make sure the time is in the future.
+  Current UTC time is {time_str}. If the time has already passed today, say:
+  "That time has already passed today. Could you pick a later time,
+  or would you prefer a different date?"
 
 STEP 5: Ask for a meeting title (tell them it's optional).
 - If they skip it, default to "Meeting with [their name]"
 
 STEP 6: Read back ALL details clearly including UTC.
-Example: "Just to confirm — I'll book 'Project Kickoff' 
-for John on Thursday February 20th 2026 at 9:00 AM UTC. 
+Example: "Just to confirm — I'll book 'Project Kickoff'
+for John on Thursday February 20th 2026 at 9:00 AM UTC.
 Does that sound right?"
 
 STEP 7: Wait for confirmation.
 - If YES: Immediately call the createCalendarEvent function
 - If NO: Ask what they'd like to change and go back to that step
 
-STEP 8: After function returns success, tell the user their event is booked 
+STEP 8: After function returns success, tell the user their event is booked
 and wish them a great day.
 
 IMPORTANT RULES:
 - Always convert dates and times to ISO 8601 before calling the function
   Example: 2026-02-20T14:00:00
 - Never call the function until the user explicitly confirms with yes
+- Never accept a past date or a past time on today's date
 - Be warm and conversational, not robotic
-- If user provides unnecessary details or goes off topic, acknowledge 
+- If user provides unnecessary details or goes off topic, acknowledge
   briefly and warmly then steer back to collecting required information
 - You are only a scheduling assistant. If asked about anything unrelated,
   politely say you can only help with booking calendar events
@@ -109,8 +121,8 @@ def home():
 def chat():
     """
     Custom LLM endpoint that Vapi calls for every conversation turn.
-    Why: By intercepting here we can inject today's date into the
-    system prompt dynamically before forwarding to Groq.
+    Why: By intercepting here we can inject today's date and current time
+    into the system prompt dynamically before forwarding to Groq.
     Vapi expects an OpenAI-compatible response format.
     """
     try:
@@ -122,7 +134,7 @@ def chat():
         # Remove any system message Vapi sends — we replace with ours
         messages = [m for m in messages if m.get('role') != 'system']
 
-        # Inject our dynamic system prompt with today's date at the top
+        # Inject our dynamic system prompt with today's date and time
         messages = [{'role': 'system', 'content': get_system_prompt()}] + messages
 
         # Define the calendar tool so Groq knows when and how to call it
@@ -193,7 +205,7 @@ def chat():
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": message.content,
+                        "content": message.content or "",
                         "tool_calls": tool_calls
                     },
                     "finish_reason": choice.finish_reason
@@ -209,8 +221,8 @@ def chat():
 def create_event():
     """
     Called by Vapi when Groq triggers the createCalendarEvent tool.
-    Extracts the arguments, creates the Google Calendar event,
-    and returns a confirmation message Vapi speaks to the user.
+    Extracts the arguments, validates the datetime, creates the Google
+    Calendar event, and returns a confirmation message Vapi speaks to user.
     """
     tool_call_id = ''
     try:
@@ -240,6 +252,22 @@ def create_event():
                 "results": [{
                     "toolCallId": tool_call_id,
                     "result": "I couldn't parse that date and time. Please try again."
+                }]
+            })
+
+        # Make start timezone aware for comparison
+        # Why: datetime.now(pytz.UTC) is timezone-aware, so start must be too
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=pytz.UTC)
+
+        # Validate: reject past dates and times
+        # Why: Safety net in case LLM misses the validation
+        now = datetime.now(pytz.UTC)
+        if start < now:
+            return jsonify({
+                "results": [{
+                    "toolCallId": tool_call_id,
+                    "result": "I'm sorry, that date and time has already passed. Please choose a future date and time."
                 }]
             })
 
