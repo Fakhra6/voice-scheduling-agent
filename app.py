@@ -215,7 +215,7 @@ def stream_text(text, response_id):
             "id": response_id,
             "object": "chat.completion.chunk",
             "created": int(datetime.now().timestamp()),
-            "model": "openai/gpt-oss-120b",
+            "model": "llama-3.3-70b-versatile",
             "choices": [
                 {
                     "index": 0,
@@ -233,7 +233,7 @@ def stream_text(text, response_id):
         "id": response_id,
         "object": "chat.completion.chunk",
         "created": int(datetime.now().timestamp()),
-        "model": "openai/gpt-oss-120b",
+        "model": "llama-3.3-70b-versatile",
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
     }
     yield f"data: {json.dumps(done_data)}\n\n"
@@ -305,7 +305,7 @@ def chat():
                         "id": "already-done",
                         "object": "chat.completion",
                         "created": int(datetime.now().timestamp()),
-                        "model": "openai/gpt-oss-120b",
+                        "model": "llama-3.3-70b-versatile",
                         "choices": [{"index": 0, "message": {"role": "assistant", "content": already_done}, "finish_reason": "stop"}]
                     })
             
@@ -327,7 +327,7 @@ def chat():
                 "id": "direct-create",
                 "object": "chat.completion",
                 "created": int(datetime.now().timestamp()),
-                "model": "openai/gpt-oss-120b",
+                "model": "llama-3.3-70b-versatile",
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": confirmation}, "finish_reason": "stop"}]
             })
         
@@ -356,7 +356,7 @@ def chat():
 
         # Always call Groq non-streaming first so we can inspect the response
         response = groq_client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model="llama-3.3-70b-versatile",
             messages=messages,
             tools=tools,
             tool_choice="auto",
