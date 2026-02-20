@@ -4,95 +4,266 @@ from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 from datetime import datetime, timedelta
 from groq import Groq
+import dateparser
 import pytz
 import os
 import json
+import uuid
 import re
 from dotenv import load_dotenv
 load_dotenv()
+
+# dateparser settings used everywhere:
+# - PREFER_DATES_FROM: future ensures "Monday" means next Monday, not last
+# - RETURN_AS_TIMEZONE_AWARE: always get a tz-aware datetime
+# - TIMEZONE: treat bare times as UTC
+DATEPARSER_SETTINGS = {
+    "PREFER_DATES_FROM": "future",
+    "RETURN_AS_TIMEZONE_AWARE": True,
+    "TIMEZONE": "UTC",
+    "PREFER_DAY_OF_MONTH": "first",
+}
 
 app = Flask(__name__)
 
 groq_client = Groq(api_key=os.environ['GROQ_API_KEY'])
 CALENDAR_ID = os.environ['CALENDAR_ID']
 
+# ─── In-memory session store ──────────────────────────────────────────────────
+# Keyed by call_id (from Vapi's message.call.id)
+# Each session holds:
+#   step       : current step name
+#   name       : confirmed user name
+#   date_iso   : confirmed date string "YYYY-MM-DD"
+#   date_label : human label e.g. "Monday, February 23rd 2026"
+#   time_iso   : confirmed time string "HH:MM" (24h UTC)
+#   time_label : human label e.g. "2:00 PM UTC"
+#   title      : confirmed meeting title
+sessions = {}
 
-def get_system_prompt():
-    today = datetime.now(pytz.UTC)
-    date_str = today.strftime('%A, %B %d, %Y')
-    time_str = today.strftime('%I:%M %p')
+STEPS = ["greet", "name", "date", "time", "title", "confirm", "done"]
 
-    return f"""You are Tara, a friendly and professional scheduling assistant.
-Today's current date is {date_str} and current time is {time_str} UTC.
-Use this to:
-- Calculate relative dates like "tomorrow", "next Monday", "this Thursday", "next week" etc.
-- Reject any date or time that is in the past
 
-Always resolve relative dates to the actual calendar date before confirming.
+def now_utc():
+    return datetime.now(pytz.UTC)
 
-Follow this conversation flow strictly:
 
-STEP 1: Greet the user warmly.
-Example: "Hi! I'm Tara, your scheduling assistant. I'd love to help you book a meeting today!"
+def get_call_id(data):
+    """Extract a stable call identifier from Vapi's request."""
+    try:
+        return data["call"]["id"]
+    except (KeyError, TypeError):
+        # Fallback: use first user message as fingerprint (less ideal)
+        messages = data.get("messages", [])
+        for m in messages:
+            if m.get("role") == "user":
+                return str(hash(m.get("content", "")))
+        return "default"
 
-STEP 2: Ask for their full name.
 
-STEP 3: Ask for the date they want.
-- Accept natural language like "tomorrow", "next Monday", "this Thursday", "March 5th"
-- Always resolve to the actual date immediately Example: if today is {date_str},
-- Once resolved, state it clearly AND include the ISO date in your response
-  Example: "Got it, that's Monday February 23rd 2026 (2026-02-23). What time works for you?"
-- This ISO date is now locked in — use it exactly when calling the function
-- Never recalculate the date later in the conversation
-- If the date is in the past ask for a future date
-- Move to asking for time only after you have a valid future date locked in
+def get_session(call_id):
+    if call_id not in sessions:
+        sessions[call_id] = {"step": "greet"}
+    return sessions[call_id]
 
-STEP 4: Ask for the time they prefer.
-- Accept natural language like "2pm", "3:30 in the afternoon"
-- Always clarify AM or PM if ambiguous
-- Let the user know the time will be saved in UTC
-- Example: "What time works for you? I'll save it in UTC."
-- If the user picks today's date, make sure the time is in the future.
-  Current UTC time is {time_str}. If the time has already passed today, say:
-  "That time has already passed today. Could you pick a later time,
-  or would you prefer a different date?"
 
-STEP 5: Ask for a meeting title (tell them it's optional).
-- If they skip it, default to "Meeting with [their name]"
+# ─── Step-specific system prompts ────────────────────────────────────────────
+# Each prompt is laser-focused on ONE task. No state bleed, no confusion.
 
-STEP 6: Read back ALL details clearly incuding UTC.
-- Use the EXACT ISO date you stated in Step 3 — do not recalculate
-- Example: "Just to confirm - I'll book 'Project Kickoff' for John 
-  on Monday February 23rd 2026 at 2:00 PM UTC. Does that sound right?"
-- When calling the function, use the same ISO date from Step 3
+def prompt_greet():
+    return (
+        "You are Tara, a friendly scheduling assistant. "
+        "Greet the user warmly and ask for their full name. "
+        "Keep it to 2 sentences max."
+    )
 
-STEP 7: Wait for confirmation.
-- If YES: Immediately call the createCalendarEvent function
-- If NO: Ask what they'd like to change and go back to that step
+def prompt_name():
+    return (
+        "You are Tara, a scheduling assistant. "
+        "The user has just responded. Extract their full name from their message. "
+        "Once you have a name, confirm it warmly and tell them you'll now help pick a date. "
+        "If you can't find a name, ask again politely."
+    )
 
-STEP 8: After function returns success, tell the user their event is booked
-and wish them a great day.
+def prompt_date(name):
+    today = now_utc()
+    return (
+        f"You are Tara, a scheduling assistant helping {name} book a meeting. "
+        f"Today is {today.strftime('%A, %B %d, %Y')} UTC. "
+        "Ask the user what date they'd like. "
+        "When they answer, resolve any relative date (tomorrow, next Monday, etc.) "
+        "to the exact calendar date. "
+        "Confirm it out loud as 'Day, Month DDth YYYY' and include the ISO date in parentheses like (2026-02-23). "
+        "If the date is in the past, politely ask for a future date. "
+        "Do not ask for the time yet."
+    )
 
-IMPORTANT RULES:
-- Always convert dates and times to ISO 8601 before calling the function
-  Example: 2026-02-20T14:00:00
-- Never call the function until the user explicitly confirms with yes
-- Never accept a past date or a past time on today's date
-- Be warm and conversational, not robotic
-- If user provides unnecessary details or goes off topic, acknowledge
-  briefly and warmly then steer back to collecting required information
-- You are only a scheduling assistant. If asked about anything unrelated,
-  politely say you can only help with booking calendar events
-- Always say the resolved actual date out loud during confirmation so
-  the user can catch any mistakes
-- When calling createCalendarEvent, the datetime ISO string MUST match
-  the exact date you verbally confirmed with the user.
-- Before calling the function, double check: does the ISO date match
-  the day name you just said? If you said "Monday February 23rd" then
-  the ISO must start with "2026-02-23". Never call the function with
-  a different date than what you confirmed.
-"""
+def prompt_time(name, date_label):
+    today = now_utc()
+    current_time = today.strftime('%I:%M %p')
+    return (
+        f"You are Tara, a scheduling assistant. The meeting for {name} is confirmed for {date_label}. "
+        f"Current UTC time is {current_time}. "
+        "Ask what time they'd like. Accept natural language (2pm, 3:30 in the afternoon). "
+        "Always clarify AM/PM if ambiguous. Confirm the time in UTC. "
+        "If they picked today and the time has already passed, ask for a later time or different date. "
+        "Do not ask for the title yet."
+    )
 
+def prompt_title(name, date_label, time_label):
+    return (
+        f"You are Tara, a scheduling assistant. "
+        f"The meeting for {name} is set for {date_label} at {time_label}. "
+        "Ask for a meeting title. Tell them it's optional — if they skip it, "
+        f"you'll use 'Meeting with {name}'. Do not book anything yet."
+    )
+
+def prompt_confirm(name, date_label, time_label, title):
+    return (
+        f"You are Tara, a scheduling assistant. "
+        f"Read back all details and ask for confirmation:\n"
+        f"- Name: {name}\n"
+        f"- Date: {date_label}\n"
+        f"- Time: {time_label}\n"
+        f"- Title: {title}\n"
+        "Say something like: 'Just to confirm, I'll book [title] for [name] on [date] at [time]. Does that sound right?' "
+        "Wait for yes or no. Do not call any functions."
+    )
+
+
+# ─── State extraction helpers ─────────────────────────────────────────────────
+
+def extract_name_from_reply(user_text, last_assistant_text):
+    """Ask LLM to extract just the name from a short exchange."""
+    resp = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": (
+                "Extract the person's full name from the user message. "
+                "Return ONLY the name, nothing else. "
+                "If you cannot find a name, return the empty string."
+            )},
+            {"role": "user", "content": f"Assistant asked: {last_assistant_text}\nUser replied: {user_text}"}
+        ],
+        temperature=0,
+        max_tokens=20,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def ordinal(day: int) -> str:
+    """Return day with ordinal suffix, e.g. 23 -> '23rd'."""
+    if 11 <= day <= 13:
+        return f"{day}th"
+    return f"{day}{['th','st','nd','rd','th','th','th','th','th','th'][day % 10]}"
+
+
+def extract_date_from_reply(user_text: str) -> tuple[str, str]:
+    """
+    Use dateparser to parse a date from free-form user text.
+
+    Returns (iso_date, human_label) e.g. ("2026-02-23", "Monday, February 23rd 2026")
+    or ("", "") if parsing fails or date is in the past.
+
+    Why dateparser beats an LLM extraction call here:
+    - Deterministic: same input always gives same output
+    - No hallucination risk
+    - Handles dozens of natural language formats out of the box:
+      "tomorrow", "next Monday", "March 5th", "in 3 days", "the 23rd", etc.
+    - PREFER_DATES_FROM=future means "Monday" = next Monday, never last Monday
+    """
+    parsed = dateparser.parse(user_text, settings=DATEPARSER_SETTINGS)
+    if not parsed:
+        return "", ""
+
+    # Normalize to midnight UTC so we compare dates cleanly
+    parsed = parsed.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=pytz.UTC)
+    today_midnight = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if parsed < today_midnight:
+        return "", ""   # past date — caller will ask user to retry
+
+    iso = parsed.strftime("%Y-%m-%d")
+    label = f"{parsed.strftime('%A, %B')} {ordinal(parsed.day)} {parsed.year}"
+    return iso, label
+
+
+def extract_time_from_reply(user_text: str, date_iso: str) -> tuple[str, str]:
+    """
+    Use dateparser to parse a time from free-form user text.
+
+    Anchors the parse to the already-confirmed date so that "2pm"
+    resolves to the correct day.  Returns (HH:MM 24h, human_label)
+    or ("", "") if ambiguous, unparseable, or already in the past.
+
+    dateparser handles:
+    - "2pm", "2 PM", "14:00", "half past two", "2:30 in the afternoon"
+    - Prefers future times when PREFER_DATES_FROM=future
+
+    One edge case dateparser can't solve alone: "3" is ambiguous (AM or PM).
+    We catch that below and return "" so the LLM conversational layer can
+    ask the user to clarify — the LLM is still used for the *conversation*,
+    just not for date/time *parsing*.
+    """
+    # Build a combined string so dateparser has both date and time context
+    combined = f"{date_iso} {user_text}"
+    parsed = dateparser.parse(combined, settings=DATEPARSER_SETTINGS)
+
+    if not parsed:
+        # Try parsing the time expression alone (dateparser sometimes
+        # rejects compound strings it can't fully tokenize)
+        parsed = dateparser.parse(user_text, settings=DATEPARSER_SETTINGS)
+        if not parsed:
+            return "", ""
+        # Graft the confirmed date onto the parsed time
+        confirmed_date = datetime.fromisoformat(date_iso)
+        parsed = parsed.replace(
+            year=confirmed_date.year,
+            month=confirmed_date.month,
+            day=confirmed_date.day,
+            tzinfo=pytz.UTC,
+        )
+
+    parsed = parsed.replace(tzinfo=pytz.UTC)
+
+    # Detect bare hour with no AM/PM (e.g. user said "3" or "seven")
+    # dateparser defaults to AM in that case — ambiguous, better to ask
+    bare_hour_pattern = re.compile(
+        r'^\s*\d{1,2}\s*$|^\s*(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*$',
+        re.IGNORECASE
+    )
+    if bare_hour_pattern.match(user_text.strip()):
+        return "", ""   # ambiguous — conversational LLM will ask AM/PM
+
+    # Reject times already in the past
+    if parsed < now_utc():
+        return "", ""
+
+    hhmm = parsed.strftime("%H:%M")
+    label = parsed.strftime("%-I:%M %p") + " UTC"   # e.g. "2:00 PM UTC"
+    return hhmm, label
+
+
+def extract_title_from_reply(user_text, default_title):
+    """Return meeting title from user reply, or default."""
+    skip_phrases = ["no", "skip", "default", "that's fine", "sure", "you can", "use that", "go ahead"]
+    lower = user_text.lower().strip()
+    if any(p in lower for p in skip_phrases) or len(lower) < 3:
+        return default_title
+    # Use the user's text directly if it's short enough to be a title
+    if len(user_text.strip()) < 80:
+        return user_text.strip().strip('"').strip("'")
+    return default_title
+
+
+def is_confirmation(user_text):
+    yes_phrases = ["yes", "yeah", "yep", "correct", "that's right", "sounds good",
+                   "looks good", "confirmed", "book it", "go ahead", "sure", "absolutely"]
+    lower = user_text.lower()
+    return any(p in lower for p in yes_phrases)
+
+
+# ─── Calendar ────────────────────────────────────────────────────────────────
 
 def get_calendar_service():
     creds = Credentials(
@@ -107,164 +278,92 @@ def get_calendar_service():
     return build('calendar', 'v3', credentials=creds)
 
 
-def extract_confirmed_date(messages):
-    """
-    Scans conversation history in reverse to find the LAST confirmation
-    message from the assistant — the one that says "Just to confirm...".
-    Extracts month and day from that specific message only.
-    
-    Why: Previous code scanned all assistant messages and could pick up
-    dates from earlier steps (like when Tara first calculated the date).
-    The confirmation message is the source of truth — it's what the user
-    agreed to.
-    """
-    month_map = {
-        'January':1,'February':2,'March':3,'April':4,
-        'May':5,'June':6,'July':7,'August':8,
-        'September':9,'October':10,'November':11,'December':12
-    }
+def create_calendar_event(session):
+    """Build ISO datetime from locked state and create the event."""
+    date_iso = session["date_iso"]      # "YYYY-MM-DD"
+    time_hhmm = session["time_iso"]    # "HH:MM"
+    name = session["name"]
+    title = session["title"]
 
-    for msg in reversed(messages):
-        if msg.get('role') != 'assistant':
-            continue
+    datetime_str = f"{date_iso}T{time_hhmm}:00"
+    start = datetime.fromisoformat(datetime_str).replace(tzinfo=pytz.UTC)
+    end = start + timedelta(hours=1)
 
-        content = msg.get('content', '')
-
-        # Only look at the confirmation message
-        # Why: This is the message the user said "yes" to
-        # It contains the date they actually agreed on
-        is_confirmation = any(phrase in content.lower() for phrase in [
-            'just to confirm',
-            'to confirm',
-            'confirm',
-            'does that sound right',
-            'sound right',
-            'is that correct',
-            'shall i book'
-        ])
-
-        if not is_confirmation:
-            continue
-
-        # Extract month and day from confirmation message
-        match = re.search(
-            r'(January|February|March|April|May|June|July|August|'
-            r'September|October|November|December)\s+(\d{1,2})',
-            content
-        )
-        if match:
-            month_str = match.group(1)
-            day = int(match.group(2))
-            return (month_map[month_str], day)
-
-    return None
-
-
-def create_calendar_event(args, messages):
-    """
-    Creates a Google Calendar event.
-    Validates the datetime against the confirmation message in conversation
-    history to catch and correct LLM date calculation errors.
-    """
-    name = args.get('name', 'Guest')
-    datetime_str = args.get('datetime', '')
-    title = args.get('title', f'Meeting with {name}')
+    # Sanity check — never book in the past
+    if start < now_utc():
+        return "I'm sorry, that time has already passed. Let me know a new time."
 
     try:
-        start = datetime.fromisoformat(datetime_str)
-    except ValueError:
-        return "I couldn't parse that date and time. Please try again."
-
-    if start.tzinfo is None:
-        start = start.replace(tzinfo=pytz.UTC)
-
-    # Cross-check against confirmation message
-    # Why: LLMs verbally confirm the correct date but sometimes generate
-    # a wrong ISO string for the function call. The confirmation message
-    # is what the user agreed to — that's the source of truth.
-    confirmed_date = extract_confirmed_date(messages)
-
-    if confirmed_date:
-        confirmed_month, confirmed_day = confirmed_date
-        if start.month != confirmed_month or start.day != confirmed_day:
-            # Correct silently — user already confirmed the right date
-            try:
-                start = start.replace(month=confirmed_month, day=confirmed_day)
-            except ValueError:
-                pass  # If correction fails, proceed with original
-
-    now = datetime.now(pytz.UTC)
-    if start < now:
-        return "I'm sorry, that date and time has already passed. Please choose a future date and time."
-
-    try:
-        end = start + timedelta(hours=1)
         service = get_calendar_service()
-
-        event_body = {
-            'summary': title,
-            'description': f'Scheduled via Voice Agent for {name}',
-            'start': {
-                'dateTime': start.isoformat(),
-                'timeZone': 'UTC',
-            },
-            'end': {
-                'dateTime': end.isoformat(),
-                'timeZone': 'UTC',
-            },
-        }
-
         service.events().insert(
             calendarId=CALENDAR_ID,
-            body=event_body
+            body={
+                'summary': title,
+                'description': f'Scheduled via Voice Agent for {name}',
+                'start': {'dateTime': start.isoformat(), 'timeZone': 'UTC'},
+                'end': {'dateTime': end.isoformat(), 'timeZone': 'UTC'},
+            }
         ).execute()
-
         return (
-            f"Done! I've created '{title}' for {name} on "
-            f"{start.strftime('%A, %B %d, %Y at %I:%M %p')} UTC. "
-            f"You're all set!"
+            f"Done! I've booked '{title}' for {name} on "
+            f"{start.strftime('%A, %B %d, %Y')} at {start.strftime('%I:%M %p')} UTC. "
+            "You're all set — have a great day!"
         )
-
     except Exception as e:
         return f"Sorry, there was an error creating your event: {str(e)}"
 
 
+# ─── Streaming helper ─────────────────────────────────────────────────────────
+
 def stream_text(text, response_id):
-    """
-    Streams text word by word in OpenAI SSE format.
-    Why: Vapi needs streaming for real-time speech output.
-    """
     words = text.split(' ')
     for i, word in enumerate(words):
         chunk_content = word + ('' if i == len(words) - 1 else ' ')
-        chunk_data = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": int(datetime.now().timestamp()),
-            "model": "llama-3.3-70b-versatile",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {
-                        "role": "assistant",
-                        "content": chunk_content
-                    },
-                    "finish_reason": None
-                }
-            ]
-        }
-        yield f"data: {json.dumps(chunk_data)}\n\n"
-
-    done_data = {
-        "id": response_id,
-        "object": "chat.completion.chunk",
-        "created": int(datetime.now().timestamp()),
-        "model": "llama-3.3-70b-versatile",
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-    }
-    yield f"data: {json.dumps(done_data)}\n\n"
+        yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': int(now_utc().timestamp()), 'model': 'llama-3.3-70b-versatile', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': chunk_content}, 'finish_reason': None}]})}\n\n"
+    yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': int(now_utc().timestamp()), 'model': 'llama-3.3-70b-versatile', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
     yield "data: [DONE]\n\n"
 
+
+def build_response(text, response_id, stream):
+    if stream:
+        return Response(
+            stream_text(text, response_id),
+            mimetype='text/event-stream',
+            headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+        )
+    return jsonify({
+        "id": response_id,
+        "object": "chat.completion",
+        "created": int(now_utc().timestamp()),
+        "model": "llama-3.3-70b-versatile",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text, "tool_calls": None}, "finish_reason": "stop"}]
+    })
+
+
+# ─── LLM call (conversational only, no tools) ────────────────────────────────
+
+def llm_respond(system_prompt, user_text, prior_assistant_text=None):
+    """
+    Single-turn or two-turn LLM call.
+    We only send the system prompt + the immediate user message (+ optional
+    prior assistant turn for context). Never the whole history.
+    """
+    messages = [{"role": "system", "content": system_prompt}]
+    if prior_assistant_text:
+        messages.append({"role": "assistant", "content": prior_assistant_text})
+    messages.append({"role": "user", "content": user_text})
+
+    resp = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages,
+        temperature=0.4,
+        max_tokens=200,
+        stream=False,
+    )
+    return resp.choices[0].message.content.strip(), resp.id
+
+
+# ─── Main endpoint ────────────────────────────────────────────────────────────
 
 @app.route('/')
 def home():
@@ -273,131 +372,154 @@ def home():
 
 @app.route('/chat/completions', methods=['POST'])
 def chat():
-    """
-    Custom LLM endpoint for Vapi.
-
-    Flow:
-    1. Call Groq non-streaming to get full response
-    2. If tool call detected -> create calendar event directly here
-       -> return confirmation as streamed text to Vapi
-    3. If regular text -> stream it to Vapi
-
-    Why handle tool calls here instead of /create-event:
-    Vapi's Custom LLM provider does not forward tool calls
-    from the LLM response to the tool server URL.
-    Everything must be handled inside this endpoint.
-    """
     try:
         data = request.json
-        messages = data.get('messages', [])
         stream = data.get('stream', False)
+        call_id = get_call_id(data)
+        session = get_session(call_id)
 
-        # Replace Vapi's system message with our dynamic one
-        messages = [m for m in messages if m.get('role') != 'system']
-        messages = [{'role': 'system', 'content': get_system_prompt()}] + messages
+        # Get latest user message
+        messages = data.get('messages', [])
+        user_messages = [m for m in messages if m.get('role') == 'user']
+        assistant_messages = [m for m in messages if m.get('role') == 'assistant']
+        user_text = user_messages[-1]['content'] if user_messages else ""
+        last_assistant_text = assistant_messages[-1]['content'] if assistant_messages else ""
 
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "createCalendarEvent",
-                    "description": "Creates a Google Calendar event. Only call this after user confirms all details.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "The user's full name"
-                            },
-                            "datetime": {
-                                "type": "string",
-                                "description": "Meeting date and time in ISO 8601 format. Example: 2026-02-20T14:00:00"
-                            },
-                            "title": {
-                                "type": "string",
-                                "description": "Meeting title. Default to 'Meeting with [name]' if not provided."
-                            }
-                        },
-                        "required": ["name", "datetime"]
-                    }
-                }
-            }
-        ]
+        step = session.get("step", "greet")
+        response_id = str(uuid.uuid4())
 
-        # Always call Groq non-streaming first so we can inspect the response
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            temperature=0.3,
-            max_tokens=1000,
-            stream=False
-        )
+        # ── GREET ────────────────────────────────────────────────────────────
+        if step == "greet":
+            reply, rid = llm_respond(prompt_greet(), "Hello")
+            session["step"] = "name"
+            session["last_assistant"] = reply
+            return build_response(reply, rid, stream)
 
-        choice = response.choices[0]
-        message = choice.message
+        # ── NAME ─────────────────────────────────────────────────────────────
+        elif step == "name":
+            name = extract_name_from_reply(user_text, last_assistant_text)
+            if name:
+                session["name"] = name
+                session["step"] = "date"
+                reply, rid = llm_respond(prompt_date(name), user_text, last_assistant_text)
+                session["last_assistant"] = reply
+                return build_response(reply, rid, stream)
+            else:
+                # Couldn't find name — ask again
+                reply, rid = llm_respond(prompt_name(), user_text, last_assistant_text)
+                session["last_assistant"] = reply
+                return build_response(reply, rid, stream)
 
-        # CASE 1: Tool call detected
-        # Create the calendar event directly here and return confirmation as text
-        if message.tool_calls:
-            tc = message.tool_calls[0]
-            args = json.loads(tc.function.arguments)
-            confirmation = create_calendar_event(args, messages)
+        # ── DATE ─────────────────────────────────────────────────────────────
+        elif step == "date":
+            name = session.get("name", "")
+            date_iso, date_label = extract_date_from_reply(user_text)
 
-            if stream:
-                return Response(
-                    stream_text(confirmation, response.id),
-                    mimetype='text/event-stream',
-                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
-                )
+            if date_iso:
+                # Validate not in the past
+                parsed = datetime.fromisoformat(date_iso).replace(tzinfo=pytz.UTC)
+                today_date = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
+                if parsed < today_date:
+                    reply, rid = llm_respond(
+                        prompt_date(name),
+                        "That date is in the past. Please ask for a future date.",
+                        last_assistant_text
+                    )
+                    session["last_assistant"] = reply
+                    return build_response(reply, rid, stream)
 
-            return jsonify({
-                "id": response.id,
-                "object": "chat.completion",
-                "created": int(datetime.now().timestamp()),
-                "model": response.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": confirmation,
-                            "tool_calls": None
-                        },
-                        "finish_reason": "stop"
-                    }
-                ]
-            })
+                session["date_iso"] = date_iso
+                session["date_label"] = date_label
+                session["step"] = "time"
+                reply, rid = llm_respond(prompt_time(name, date_label), user_text, last_assistant_text)
+                session["last_assistant"] = reply
+                return build_response(reply, rid, stream)
+            else:
+                # Couldn't resolve date — ask again
+                reply, rid = llm_respond(prompt_date(name), user_text, last_assistant_text)
+                session["last_assistant"] = reply
+                return build_response(reply, rid, stream)
 
-        # CASE 2: Regular text response — stream it
-        content = message.content or ""
+        # ── TIME ─────────────────────────────────────────────────────────────
+        elif step == "time":
+            name = session.get("name", "")
+            date_iso = session.get("date_iso", "")
+            date_label = session.get("date_label", "")
+            time_hhmm, time_label = extract_time_from_reply(user_text, date_iso)
 
-        if stream:
-            return Response(
-                stream_text(content, response.id),
-                mimetype='text/event-stream',
-                headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
-            )
+            if time_hhmm:
+                session["time_iso"] = time_hhmm
+                session["time_label"] = time_label
+                session["step"] = "title"
+                reply, rid = llm_respond(prompt_title(name, date_label, time_label), user_text, last_assistant_text)
+                session["last_assistant"] = reply
+                return build_response(reply, rid, stream)
+            else:
+                # Time in the past or ambiguous
+                reply, rid = llm_respond(prompt_time(name, date_label), user_text, last_assistant_text)
+                session["last_assistant"] = reply
+                return build_response(reply, rid, stream)
 
-        # CASE 3: Non-streaming fallback
-        return jsonify({
-            "id": response.id,
-            "object": "chat.completion",
-            "created": int(datetime.now().timestamp()),
-            "model": response.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content,
-                        "tool_calls": None
-                    },
-                    "finish_reason": "stop"
-                }
-            ]
-        })
+        # ── TITLE ────────────────────────────────────────────────────────────
+        elif step == "title":
+            name = session.get("name", "")
+            date_label = session.get("date_label", "")
+            time_label = session.get("time_label", "")
+            default_title = f"Meeting with {name}"
+            title = extract_title_from_reply(user_text, default_title)
+            session["title"] = title
+            session["step"] = "confirm"
+            reply, rid = llm_respond(prompt_confirm(name, date_label, time_label, title), user_text)
+            session["last_assistant"] = reply
+            return build_response(reply, rid, stream)
+
+        # ── CONFIRM ──────────────────────────────────────────────────────────
+        elif step == "confirm":
+            if is_confirmation(user_text):
+                session["step"] = "done"
+                result = create_calendar_event(session)
+                return build_response(result, response_id, stream)
+            else:
+                # User wants to change something — detect which field
+                lower = user_text.lower()
+                if any(w in lower for w in ["date", "day", "monday", "tuesday", "wednesday",
+                                             "thursday", "friday", "saturday", "sunday",
+                                             "tomorrow", "next", "january", "february",
+                                             "march", "april", "may", "june", "july",
+                                             "august", "september", "october", "november", "december"]):
+                    session["step"] = "date"
+                    session.pop("date_iso", None)
+                    session.pop("date_label", None)
+                    session.pop("time_iso", None)
+                    session.pop("time_label", None)
+                    session.pop("title", None)
+                    reply, rid = llm_respond(prompt_date(session["name"]), user_text)
+                elif any(w in lower for w in ["time", "am", "pm", "o'clock", "hour"]):
+                    session["step"] = "time"
+                    session.pop("time_iso", None)
+                    session.pop("time_label", None)
+                    session.pop("title", None)
+                    reply, rid = llm_respond(
+                        prompt_time(session["name"], session.get("date_label", "")), user_text
+                    )
+                elif any(w in lower for w in ["title", "name", "call it", "meeting"]):
+                    session["step"] = "title"
+                    session.pop("title", None)
+                    reply, rid = llm_respond(
+                        prompt_title(session["name"], session.get("date_label", ""), session.get("time_label", "")),
+                        user_text
+                    )
+                else:
+                    # Generic "no" — ask what to change
+                    reply = "No problem! What would you like to change — the date, time, or title?"
+                    rid = response_id
+                session["last_assistant"] = reply
+                return build_response(reply, rid, stream)
+
+        # ── DONE (repeat booking or anything after) ──────────────────────────
+        else:
+            reply = "Your meeting is already booked! Is there anything else I can help you with?"
+            return build_response(reply, response_id, stream)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500

@@ -6,3 +6,4 @@ gunicorn
 groq
 pytz
 python-dotenv
+dateparser
