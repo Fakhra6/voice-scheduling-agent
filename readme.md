@@ -7,7 +7,7 @@ natural conversation. Built with Vapi.ai, Groq (Llama 3.3 70B versatile), Python
 
 
 ## Architecture
-
+```mermaid
 graph TD
     A[User Speaks] -->|Audio| B(Vapi: Speech-to-Text)
     B -->|Text Transcript| C{Flask Endpoint}
@@ -29,7 +29,7 @@ graph TD
 
     style D fill:#f9f,stroke:#333,stroke-width:2px
     style H fill:#4285F4,color:#fff
-
+```
 
 ---
 
@@ -47,13 +47,14 @@ graph TD
 
 
 
-### Prerequisites
+## Prerequisites
 - Python 3.8+
 - Git
 - A Google Cloud project with Calendar API enabled
 - Groq API key
 - Vapi account
 
+---
 
 ## Environment Variables
 
