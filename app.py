@@ -81,6 +81,12 @@ IMPORTANT RULES:
   politely say you can only help with booking calendar events
 - Always say the resolved actual date out loud during confirmation so
   the user can catch any mistakes
+- When calling createCalendarEvent, the datetime ISO string MUST match 
+  the exact date you verbally confirmed with the user.
+- Before calling the function, double check: does the ISO date match 
+  the day name you just said? If you said "Monday February 23rd" then 
+  the ISO must start with "2026-02-23". Never call the function with 
+  a different date than what you confirmed.
 """
 
 
