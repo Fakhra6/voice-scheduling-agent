@@ -114,7 +114,7 @@ def get_calendar_service():
 def parse_date_from_text(text, reference_date=None):
     """
     Dynamically parses a date from natural language using dateparser.
-    No hardcoded patterns - relies on dateparser's NLP capabilities.
+    Handles "next Monday", "tomorrow", etc. using dateparser's NLP.
     """
     if not text:
         return None
@@ -122,7 +122,11 @@ def parse_date_from_text(text, reference_date=None):
     if reference_date is None:
         reference_date = datetime.now(pytz.UTC)
     
-    # Use dateparser with optimal settings for natural language
+    text_lower = text.lower().strip()
+    now = datetime.now(pytz.UTC)
+    
+    # Try multiple parsing strategies for better accuracy
+    # Strategy 1: Direct dateparser parse
     parsed = dateparser.parse(
         text,
         settings={
@@ -140,11 +144,10 @@ def parse_date_from_text(text, reference_date=None):
         else:
             parsed = parsed.astimezone(pytz.UTC)
         
-        # Ensure it's a future date
-        now = datetime.now(pytz.UTC)
-        if parsed.date() < now.date():
-            # If past date, try with future preference more aggressively
-            future_ref = reference_date + timedelta(days=1)
+        # If we got a past date but text suggests future, try again
+        if parsed.date() < now.date() and any(word in text_lower for word in ['next', 'tomorrow', 'upcoming']):
+            # Try with a future reference point
+            future_ref = reference_date + timedelta(days=7)
             parsed = dateparser.parse(
                 text,
                 settings={
@@ -162,6 +165,29 @@ def parse_date_from_text(text, reference_date=None):
         # Final validation: must be future date
         if parsed and parsed.date() >= now.date():
             return parsed
+    
+    # Strategy 2: If dateparser failed, try with cleaned text
+    # Remove common filler words that might confuse dateparser
+    cleaned_text = text_lower
+    for word in ['on', 'for', 'the', 'a', 'an']:
+        cleaned_text = cleaned_text.replace(f' {word} ', ' ')
+    
+    if cleaned_text != text_lower:
+        parsed = dateparser.parse(
+            cleaned_text,
+            settings={
+                'RELATIVE_BASE': reference_date.replace(tzinfo=None),
+                'PREFER_DATES_FROM': 'future',
+                'RETURN_AS_TIMEZONE_AWARE': False
+            }
+        )
+        if parsed:
+            if parsed.tzinfo is None:
+                parsed = pytz.UTC.localize(parsed)
+            else:
+                parsed = parsed.astimezone(pytz.UTC)
+            if parsed.date() >= now.date():
+                return parsed
     
     return None
 
@@ -236,25 +262,58 @@ def extract_info_from_conversation(messages, conversation_id=None):
     # We only store it if the LLM provides it in a function call
     
     # Parse date dynamically from user messages
-    if not extracted['parsed_date'] and all_user_text:
-        parsed_date = parse_date_from_text(all_user_text, today)
-        if parsed_date:
-            extracted['parsed_date'] = parsed_date
+    # Try full conversation context first, then individual messages
+    if not extracted['parsed_date']:
+        if all_user_text:
+            parsed_date = parse_date_from_text(all_user_text, today)
+            if parsed_date:
+                extracted['parsed_date'] = parsed_date
+        
+        # If still no date, try each user message individually
+        if not extracted['parsed_date']:
+            for msg in reversed(messages):  # Check most recent first
+                if msg.get('role') == 'user':
+                    content = msg.get('content', '').strip()
+                    if content:
+                        parsed_date = parse_date_from_text(content, today)
+                        if parsed_date:
+                            extracted['parsed_date'] = parsed_date
+                            break
     
     # Parse time dynamically from user messages
-    if not extracted['parsed_time'] and all_user_text:
+    if not extracted['parsed_time']:
         ref_date = extracted['parsed_date'] if extracted['parsed_date'] else today
-        parsed_time = parse_time_from_text(all_user_text, ref_date)
-        if parsed_time:
-            # Combine with date if we have one
-            if extracted['parsed_date']:
-                parsed_time = extracted['parsed_date'].replace(
-                    hour=parsed_time.hour,
-                    minute=parsed_time.minute,
-                    second=0,
-                    microsecond=0
-                )
-            extracted['parsed_time'] = parsed_time
+        
+        if all_user_text:
+            parsed_time = parse_time_from_text(all_user_text, ref_date)
+            if parsed_time:
+                # Combine with date if we have one
+                if extracted['parsed_date']:
+                    parsed_time = extracted['parsed_date'].replace(
+                        hour=parsed_time.hour,
+                        minute=parsed_time.minute,
+                        second=0,
+                        microsecond=0
+                    )
+                extracted['parsed_time'] = parsed_time
+        
+        # If still no time, try each user message individually
+        if not extracted['parsed_time']:
+            for msg in reversed(messages):  # Check most recent first
+                if msg.get('role') == 'user':
+                    content = msg.get('content', '').strip()
+                    if content:
+                        parsed_time = parse_time_from_text(content, ref_date)
+                        if parsed_time:
+                            if extracted['parsed_date']:
+                                parsed_time = extracted['parsed_date'].replace(
+                                    hour=parsed_time.hour,
+                                    minute=parsed_time.minute,
+                                    second=0,
+                                    microsecond=0
+                                )
+                            extracted['parsed_time'] = parsed_time
+                            break
     
     # Ensure date and time are synchronized
     if extracted['parsed_date'] and extracted['parsed_time']:
@@ -473,19 +532,20 @@ def chat():
             tc = message.tool_calls[0]
             args = json.loads(tc.function.arguments)
             
-            # Validate and override with server-parsed values (dynamic validation layer)
-            # Strategy: Use server-parsed values if available, otherwise validate LLM's extraction
+            # CRITICAL: Always override with server-parsed values if available
+            # This prevents LLM date hallucinations
             datetime_str = args.get('datetime', '')
             
-            # If we have server-parsed date/time, use them (most reliable)
+            # Priority 1: Use server-parsed date/time (most reliable - prevents hallucinations)
             if extracted['parsed_date']:
                 if extracted['parsed_time']:
-                    # We have both from server parsing - use them
+                    # We have both date and time from server parsing - ALWAYS use them
                     combined_datetime = extracted['parsed_time']
                 else:
                     # We have date but not time - extract time from LLM's datetime
                     try:
                         parsed_from_args = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
+                        # Use server-parsed date with LLM-extracted time
                         combined_datetime = extracted['parsed_date'].replace(
                             hour=parsed_from_args.hour,
                             minute=parsed_from_args.minute,
@@ -496,6 +556,7 @@ def chat():
                         # Fallback: use parsed date at 2 PM
                         combined_datetime = extracted['parsed_date'].replace(hour=14, minute=0, second=0, microsecond=0)
                 
+                # ALWAYS override with server-parsed date to prevent hallucinations
                 args['datetime'] = combined_datetime.isoformat()
             elif extracted['parsed_time']:
                 # We have time but not date - use LLM's date with server-parsed time
@@ -511,23 +572,39 @@ def chat():
                 except:
                     pass  # If parsing fails, let LLM's value stand
             else:
-                # No server-parsed values - validate LLM's datetime by parsing it
-                # This catches cases where LLM hallucinates dates
+                # No server-parsed values - validate LLM's datetime
+                # Try to re-parse from conversation as a safety check
                 try:
                     llm_datetime = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
-                    # Check if it's in the past (likely hallucination)
                     now = datetime.now(pytz.UTC)
-                    if llm_datetime.replace(tzinfo=pytz.UTC) < now:
-                        # LLM gave us a past date - try to re-parse from conversation
-                        all_user_text = " ".join([
-                            msg.get('content', '') for msg in messages 
-                            if msg.get('role') == 'user'
-                        ])
-                        if all_user_text:
-                            # Try to parse date from conversation
-                            validated_date = parse_date_from_text(all_user_text, now)
-                            if validated_date:
+                    
+                    # Re-parse from conversation to validate
+                    all_user_text = " ".join([
+                        msg.get('content', '') for msg in messages 
+                        if msg.get('role') == 'user'
+                    ])
+                    
+                    if all_user_text:
+                        # Try to parse date from conversation
+                        validated_date = parse_date_from_text(all_user_text, now)
+                        if validated_date:
+                            # If validated date differs significantly from LLM's date, use validated
+                            # This catches hallucinations even if date is in the future
+                            llm_date = llm_datetime.replace(tzinfo=pytz.UTC).date()
+                            validated_date_only = validated_date.date()
+                            
+                            # If dates differ by more than 1 day, use validated date
+                            if abs((validated_date_only - llm_date).days) > 1:
                                 # Use validated date with LLM's time
+                                combined_datetime = validated_date.replace(
+                                    hour=llm_datetime.hour,
+                                    minute=llm_datetime.minute,
+                                    second=0,
+                                    microsecond=0
+                                )
+                                args['datetime'] = combined_datetime.isoformat()
+                            elif llm_datetime.replace(tzinfo=pytz.UTC) < now:
+                                # LLM gave us a past date - use validated date
                                 combined_datetime = validated_date.replace(
                                     hour=llm_datetime.hour,
                                     minute=llm_datetime.minute,
