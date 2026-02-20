@@ -209,7 +209,7 @@ def chat():
     
     Why handle tool calls here instead of /create-event:
     Vapi's Custom LLM provider does not forward tool calls
-    from the LLM response to the tool's server URL.
+    from the LLM response to the tool's server URL (tested previously with multiple attempts and support confirmation).
     Everything must be handled inside this endpoint.
     """
     try:
