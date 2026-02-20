@@ -122,12 +122,25 @@ import json
 
 @app.route('/chat/completions', methods=['POST'])
 def chat():
+    """
+    Custom LLM endpoint that Vapi calls for every conversation turn.
+
+    Key logic:
+    - Always call Groq in non-streaming mode first
+    - If Groq wants to call a tool: return as complete JSON (non-streaming)
+      Why: Tool calls must be complete JSON, not streamed chunks
+    - If Groq returns text: stream it word by word
+      Why: Streaming gives natural real-time speech in Vapi
+    """
     try:
         data = request.json
         messages = data.get('messages', [])
         stream = data.get('stream', False)
 
+        # Remove Vapi's system message - replace with ours
         messages = [m for m in messages if m.get('role') != 'system']
+
+        # Inject dynamic system prompt with today's date and time
         messages = [{'role': 'system', 'content': get_system_prompt()}] + messages
 
         tools = [
@@ -158,109 +171,37 @@ def chat():
             }
         ]
 
-        if stream:
-            # Streaming response for Vapi
-            def generate():
-                response = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto",
-                    temperature=0.3,
-                    max_tokens=1000,
-                    stream=True
-                )
+        # Always call Groq non-streaming first
+        # Why: We need to inspect the response before deciding
+        # whether to return a tool call or stream text
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.3,
+            max_tokens=1000,
+            stream=False
+        )
 
-                for chunk in response:
-                    if chunk.choices[0].delta.content:
-                        data = {
-                            "id": chunk.id,
-                            "object": "chat.completion.chunk",
-                            "created": int(datetime.now().timestamp()),
-                            "model": "llama-3.3-70b-versatile",
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "role": "assistant",
-                                        "content": chunk.choices[0].delta.content
-                                    },
-                                    "finish_reason": None
-                                }
-                            ]
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
+        choice = response.choices[0]
+        message = choice.message
 
-                    elif chunk.choices[0].finish_reason:
-                        # Handle tool calls in streaming
-                        tool_calls = None
-                        if hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
-                            tool_calls = [
-                                {
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.function.name,
-                                        "arguments": tc.function.arguments
-                                    }
-                                }
-                                for tc in chunk.choices[0].delta.tool_calls
-                            ]
-
-                        done_data = {
-                            "id": chunk.id,
-                            "object": "chat.completion.chunk",
-                            "created": int(datetime.now().timestamp()),
-                            "model": "llama-3.3-70b-versatile",
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": chunk.choices[0].finish_reason,
-                                    "tool_calls": tool_calls
-                                }
-                            ]
-                        }
-                        yield f"data: {json.dumps(done_data)}\n\n"
-
-                yield "data: [DONE]\n\n"
-
-            return Response(
-                generate(),
-                mimetype='text/event-stream',
-                headers={
-                    'Cache-Control': 'no-cache',
-                    'X-Accel-Buffering': 'no'
-                }
-            )
-
-        else:
-            # Non-streaming response (fallback)
-            response = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                temperature=0.3,
-                max_tokens=1000
-            )
-
-            choice = response.choices[0]
-            message = choice.message
-
-            tool_calls = None
-            if message.tool_calls:
-                tool_calls = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
+        # CASE 1: Groq wants to call a tool
+        # Return as complete non-streaming JSON
+        # Why: Vapi needs complete tool call JSON to trigger /create-event
+        if message.tool_calls:
+            tool_calls = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
                     }
-                    for tc in message.tool_calls
-                ]
+                }
+                for tc in message.tool_calls
+            ]
 
             return jsonify({
                 "id": response.id,
@@ -275,14 +216,85 @@ def chat():
                             "content": message.content or "",
                             "tool_calls": tool_calls
                         },
-                        "finish_reason": choice.finish_reason
+                        "finish_reason": "tool_calls"
                     }
                 ]
             })
 
+        # CASE 2: Groq returns text - stream it if Vapi asked for streaming
+        # Why: Streaming gives natural word-by-word speech output in Vapi
+        if stream:
+            def generate():
+                content = message.content or ""
+                words = content.split(' ')
+
+                for i, word in enumerate(words):
+                    chunk_content = word + ('' if i == len(words) - 1 else ' ')
+                    chunk_data = {
+                        "id": response.id,
+                        "object": "chat.completion.chunk",
+                        "created": int(datetime.now().timestamp()),
+                        "model": "llama-3.3-70b-versatile",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": chunk_content
+                                },
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(chunk_data)}\n\n"
+
+                # Final chunk signals end of stream
+                done_data = {
+                    "id": response.id,
+                    "object": "chat.completion.chunk",
+                    "created": int(datetime.now().timestamp()),
+                    "model": "llama-3.3-70b-versatile",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop"
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(done_data)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return Response(
+                generate(),
+                mimetype='text/event-stream',
+                headers={
+                    'Cache-Control': 'no-cache',
+                    'X-Accel-Buffering': 'no'
+                }
+            )
+
+        # CASE 3: Non-streaming fallback
+        return jsonify({
+            "id": response.id,
+            "object": "chat.completion",
+            "created": int(datetime.now().timestamp()),
+            "model": response.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": message.content or "",
+                        "tool_calls": None
+                    },
+                    "finish_reason": choice.finish_reason
+                }
+            ]
+        })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route('/create-event', methods=['POST'])
 def create_event():
