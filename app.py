@@ -157,11 +157,13 @@ def parse_date_from_text(text, reference_date=None):
         'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6
     }
     
-    # Check for "next [day]" pattern dynamically
-    if 'next' in text_lower:
+    # Check for "next [day]" or "upcoming [day]" patterns dynamically
+    # "upcoming" = next occurrence (this week or next week)
+    # "next" = the one after upcoming (add extra week)
+    if 'next' in text_lower or 'upcoming' in text_lower:
         for day_name, day_num in days_map.items():
             if day_name in text_lower:
-                # Calculate next occurrence of that day
+                # Calculate occurrence of that day
                 current_weekday = reference_date.weekday()
                 days_ahead = day_num - current_weekday
                 
@@ -169,8 +171,10 @@ def parse_date_from_text(text, reference_date=None):
                     # Day already passed this week, go to next week
                     days_ahead += 7
                 
-                # "next" means add another week
-                days_ahead += 7
+                # "next" means add another week (the week after upcoming)
+                # "upcoming" means just the next occurrence (this week or next week)
+                if 'next' in text_lower:
+                    days_ahead += 7
                 
                 target_date = reference_date + timedelta(days=days_ahead)
                 result = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -198,8 +202,8 @@ def parse_date_from_text(text, reference_date=None):
             parsed = parsed.astimezone(pytz.UTC)
         
         # Validate the parsed date makes sense
-        # If dateparser gave us a wrong day of week for "next [day]", recalculate
-        if 'next' in text_lower:
+        # If dateparser gave us a wrong day of week for "next [day]" or "upcoming [day]", recalculate
+        if 'next' in text_lower or 'upcoming' in text_lower:
             for day_name, day_num in days_map.items():
                 if day_name in text_lower:
                     # Check if parsed date matches the expected day
@@ -209,7 +213,9 @@ def parse_date_from_text(text, reference_date=None):
                         days_ahead = day_num - current_weekday
                         if days_ahead <= 0:
                             days_ahead += 7
-                        days_ahead += 7  # "next" means add a week
+                        # "next" means add another week, "upcoming" doesn't
+                        if 'next' in text_lower:
+                            days_ahead += 7
                         target_date = reference_date + timedelta(days=days_ahead)
                         result = target_date.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
                         if result.date() >= now.date():
@@ -266,6 +272,7 @@ def parse_time_from_text(text, reference_date=None):
     """
     Dynamically parses a time from natural language using dateparser.
     Returns a datetime with the parsed time on the reference_date.
+    Handles single digits like "4" as 4 PM (afternoon) - common for meetings.
     """
     if not text:
         return None
@@ -273,7 +280,11 @@ def parse_time_from_text(text, reference_date=None):
     if reference_date is None:
         reference_date = datetime.now(pytz.UTC)
     
-    # Use dateparser to parse time - it handles natural language well
+    text_lower = text.lower().strip()
+    
+    # Handle single digit times (e.g., "4" without AM/PM)
+    # For voice conversations, single digits usually mean PM (afternoon meetings)
+    # Let dateparser try first, but if it fails or gives midnight, interpret as PM
     parsed = dateparser.parse(
         text,
         settings={
@@ -289,6 +300,20 @@ def parse_time_from_text(text, reference_date=None):
         else:
             parsed = parsed.astimezone(pytz.UTC)
         
+        # Check if it's just a single digit (like "4")
+        # If dateparser gave us midnight (00:00) for a single digit, assume PM
+        if parsed.hour == 0 and parsed.minute == 0:
+            # Check if text is just a number 1-12
+            try:
+                hour_num = int(text_lower.strip())
+                if 1 <= hour_num <= 12:
+                    # Single digit without AM/PM - assume PM for meetings
+                    hour_24 = 12 if hour_num == 12 else hour_num + 12
+                    result = reference_date.replace(hour=hour_24, minute=0, second=0, microsecond=0)
+                    return result
+            except ValueError:
+                pass
+        
         # Extract just the time components and apply to reference date
         result = reference_date.replace(
             hour=parsed.hour,
@@ -297,6 +322,17 @@ def parse_time_from_text(text, reference_date=None):
             microsecond=0
         )
         return result
+    
+    # If dateparser failed, try interpreting single digits as PM
+    try:
+        hour_num = int(text_lower.strip())
+        if 1 <= hour_num <= 12:
+            # Single digit without AM/PM - assume PM for meetings
+            hour_24 = 12 if hour_num == 12 else hour_num + 12
+            result = reference_date.replace(hour=hour_24, minute=0, second=0, microsecond=0)
+            return result
+    except ValueError:
+        pass
 
     return None
 
@@ -305,19 +341,13 @@ def extract_info_from_conversation(messages, conversation_id=None):
     """
     Dynamically extracts information from conversation using LLM extraction + server-side validation.
     No regex patterns - relies on LLM to extract naturally, then validates with dateparser.
+    CRITICAL: Always re-parse from recent messages to catch date/time changes.
     """
     extracted = {
         'parsed_date': None,
         'parsed_time': None,
         'user_name': None
     }
-    
-    # Get conversation state if available (persist across requests)
-    if conversation_id and conversation_id in conversation_state:
-        state = conversation_state[conversation_id]
-        extracted['parsed_date'] = state.get('parsed_date')
-        extracted['parsed_time'] = state.get('parsed_time')
-        extracted['user_name'] = state.get('user_name')
     
     today = datetime.now(pytz.UTC)
     
@@ -327,63 +357,61 @@ def extract_info_from_conversation(messages, conversation_id=None):
         if msg.get('role') == 'user'
     ])
     
-    # Name extraction: Fully LLM-driven - we don't pre-extract names
-    # The LLM will extract the name naturally from conversation
-    # We only store it if the LLM provides it in a function call
+    # CRITICAL: Always re-parse dates from recent messages first
+    # This ensures we catch when user changes the date (e.g., "no i want it on upcoming tuesday")
+    # Check messages in reverse order (most recent first) to catch changes
+    for msg in reversed(messages):
+        if msg.get('role') == 'user':
+            content = msg.get('content', '').strip()
+            if content:
+                # Check if this message contains a date reference
+                # Use dateparser to detect date mentions naturally
+                parsed_date = parse_date_from_text(content, today)
+                if parsed_date:
+                    # Found a date in recent message - use it (overrides any previous date)
+                    extracted['parsed_date'] = parsed_date
+                    break
     
-    # Parse date dynamically from user messages
-    # Try full conversation context first, then individual messages
-    if not extracted['parsed_date']:
-        if all_user_text:
-            parsed_date = parse_date_from_text(all_user_text, today)
-            if parsed_date:
-                extracted['parsed_date'] = parsed_date
-        
-        # If still no date, try each user message individually
-        if not extracted['parsed_date']:
-            for msg in reversed(messages):  # Check most recent first
-                if msg.get('role') == 'user':
-                    content = msg.get('content', '').strip()
-                    if content:
-                        parsed_date = parse_date_from_text(content, today)
-                        if parsed_date:
-                            extracted['parsed_date'] = parsed_date
-                            break
+    # Fallback: If no date found in individual messages, try full context
+    if not extracted['parsed_date'] and all_user_text:
+        parsed_date = parse_date_from_text(all_user_text, today)
+        if parsed_date:
+            extracted['parsed_date'] = parsed_date
     
     # Parse time dynamically from user messages
-    if not extracted['parsed_time']:
-        ref_date = extracted['parsed_date'] if extracted['parsed_date'] else today
-        
-        if all_user_text:
-            parsed_time = parse_time_from_text(all_user_text, ref_date)
-            if parsed_time:
-                # Combine with date if we have one
-                if extracted['parsed_date']:
-                    parsed_time = extracted['parsed_date'].replace(
-                        hour=parsed_time.hour,
-                        minute=parsed_time.minute,
-                        second=0,
-                        microsecond=0
-                    )
-                extracted['parsed_time'] = parsed_time
-        
-        # If still no time, try each user message individually
-        if not extracted['parsed_time']:
-            for msg in reversed(messages):  # Check most recent first
-                if msg.get('role') == 'user':
-                    content = msg.get('content', '').strip()
-                    if content:
-                        parsed_time = parse_time_from_text(content, ref_date)
-                        if parsed_time:
-                            if extracted['parsed_date']:
-                                parsed_time = extracted['parsed_date'].replace(
-                                    hour=parsed_time.hour,
-                                    minute=parsed_time.minute,
-                                    second=0,
-                                    microsecond=0
-                                )
-                            extracted['parsed_time'] = parsed_time
-                            break
+    # CRITICAL: Always re-parse from recent messages to catch time changes
+    ref_date = extracted['parsed_date'] if extracted['parsed_date'] else today
+    
+    # Check messages in reverse order (most recent first) to catch changes
+    for msg in reversed(messages):
+        if msg.get('role') == 'user':
+            content = msg.get('content', '').strip()
+            if content:
+                parsed_time = parse_time_from_text(content, ref_date)
+                if parsed_time:
+                    # Found a time in recent message - use it (overrides any previous time)
+                    if extracted['parsed_date']:
+                        parsed_time = extracted['parsed_date'].replace(
+                            hour=parsed_time.hour,
+                            minute=parsed_time.minute,
+                            second=0,
+                            microsecond=0
+                        )
+                    extracted['parsed_time'] = parsed_time
+                    break
+    
+    # Fallback: If no time found in individual messages, try full context
+    if not extracted['parsed_time'] and all_user_text:
+        parsed_time = parse_time_from_text(all_user_text, ref_date)
+        if parsed_time:
+            if extracted['parsed_date']:
+                parsed_time = extracted['parsed_date'].replace(
+                    hour=parsed_time.hour,
+                    minute=parsed_time.minute,
+                    second=0,
+                    microsecond=0
+                )
+            extracted['parsed_time'] = parsed_time
     
     # Ensure date and time are synchronized
     if extracted['parsed_date'] and extracted['parsed_time']:
