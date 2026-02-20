@@ -16,33 +16,17 @@ groq_client = Groq(api_key=os.environ['GROQ_API_KEY'])
 CALENDAR_ID = os.environ['CALENDAR_ID']
 
 
-def get_system_prompt(parsed_date=None, parsed_time=None, user_name=None):
+def get_system_prompt():
     today = datetime.now(pytz.UTC)
-    
-    # Build context about what we know
-    known_info = []
-    if user_name:
-        known_info.append(f"Name: {user_name}")
-    if parsed_date:
-        known_info.append(f"Date: {parsed_date.strftime('%A, %B %d, %Y')}")
-    if parsed_time:
-        known_info.append(f"Time: {parsed_time.strftime('%I:%M %p')} UTC")
-    
-    context = ""
-    if known_info:
-        context = f"\n\nEXTRACTED INFO (use these exact values):\n" + "\n".join(f"- {info}" for info in known_info)
 
     return f"""You are Tara, a friendly scheduling assistant for Google Calendar.
 Today is {today.strftime('%A, %B %d, %Y')} at {today.strftime('%I:%M %p')} UTC.
-{context}
 
 Help users schedule calendar events by collecting: name, date, time, and optional title.
 
-Be natural and conversational. Users may provide info all at once or gradually - adapt to their style.
-
-When confirming, always state the full resolved date (e.g., "Tuesday, February 24th, 2026 at 4:00 PM UTC").
-Only call createCalendarEvent after user explicitly confirms. Use EXTRACTED INFO values if available.
-Times are in UTC. Never accept past dates/times."""
+Be natural and conversational. When user confirms with "yes" or similar, immediately call createCalendarEvent.
+Do not repeat details or apologize - just create the event.
+Times are in UTC."""
 
 
 def get_calendar_service():
@@ -227,7 +211,7 @@ def stream_text(text, response_id):
             "id": response_id,
             "object": "chat.completion.chunk",
             "created": int(datetime.now().timestamp()),
-            "model": "llama-3.3-70b-versatile",
+            "model": "openai/gpt-oss-120b",
             "choices": [
                 {
                     "index": 0,
@@ -245,7 +229,7 @@ def stream_text(text, response_id):
         "id": response_id,
         "object": "chat.completion.chunk",
         "created": int(datetime.now().timestamp()),
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
     }
     yield f"data: {json.dumps(done_data)}\n\n"
@@ -284,26 +268,74 @@ def chat():
         # Extract information from conversation using LLM (simple and reliable)
         extracted = extract_info_with_llm(messages)
         
-        # Replace Vapi's system message with our dynamic one that includes parsed info
+        # Check if user just confirmed (yes, ok, sure, etc.) and we have all info
+        # If so, skip the LLM and create the event directly
+        last_user_msg = ""
+        for msg in reversed(messages):
+            if msg.get('role') == 'user':
+                last_user_msg = msg.get('content', '').strip().lower()
+                break
+        
+        confirmations = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'sounds good', 'perfect', 'great', 'do it', 'go ahead', 'confirm', 'book it', 'yes please', 'that works', 'correct', 'right', 'absolutely']
+        is_confirmation = any(last_user_msg == c or last_user_msg.startswith(c + ' ') or last_user_msg.startswith(c + ',') or last_user_msg.startswith(c + '.') for c in confirmations)
+        
+        if is_confirmation and extracted['parsed_time'] and extracted['user_name']:
+            # Check if already created (prevent duplicates)
+            for msg in messages:
+                if msg.get('role') == 'assistant' and "Done! I've created" in msg.get('content', ''):
+                    already_done = "Your event has already been created! Is there anything else I can help you with?"
+                    if stream:
+                        return Response(
+                            stream_text(already_done, "already-done"),
+                            mimetype='text/event-stream',
+                            headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+                        )
+                    return jsonify({
+                        "id": "already-done",
+                        "object": "chat.completion",
+                        "created": int(datetime.now().timestamp()),
+                        "model": "openai/gpt-oss-120b",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": already_done}, "finish_reason": "stop"}]
+                    })
+            
+            # User confirmed and we have all info - create event directly
+            args = {
+                'name': extracted['user_name'],
+                'datetime': extracted['parsed_time'].isoformat(),
+                'title': extracted.get('title') or f"Meeting with {extracted['user_name']}"
+            }
+            confirmation = create_calendar_event(args, messages)
+            
+            if stream:
+                return Response(
+                    stream_text(confirmation, "direct-create"),
+                    mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+                )
+            return jsonify({
+                "id": "direct-create",
+                "object": "chat.completion",
+                "created": int(datetime.now().timestamp()),
+                "model": "openai/gpt-oss-120b",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": confirmation}, "finish_reason": "stop"}]
+            })
+        
+        # Replace Vapi's system message with ours
         messages = [m for m in messages if m.get('role') != 'system']
-        messages = [{'role': 'system', 'content': get_system_prompt(
-            parsed_date=extracted['parsed_date'],
-            parsed_time=extracted['parsed_time'],
-            user_name=extracted['user_name']
-        )}] + messages
+        messages = [{'role': 'system', 'content': get_system_prompt()}] + messages
 
         tools = [
             {
                 "type": "function",
                 "function": {
                     "name": "createCalendarEvent",
-                    "description": "Creates a calendar event. Call only after user confirms the date, time, and details.",
+                    "description": "Creates a calendar event. Call after user confirms.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "name": {"type": "string", "description": "User's name"},
-                            "datetime": {"type": "string", "description": "ISO 8601 datetime (YYYY-MM-DDTHH:MM:SS). Use EXTRACTED INFO values."},
-                            "title": {"type": "string", "description": "Meeting title (default: 'Meeting with [name]')"}
+                            "datetime": {"type": "string", "description": "ISO 8601 datetime (YYYY-MM-DDTHH:MM:SS)"},
+                            "title": {"type": "string", "description": "Meeting title"}
                         },
                         "required": ["name", "datetime"]
                     }
