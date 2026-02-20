@@ -571,28 +571,6 @@ def chat():
         # Extract information from conversation (server-side parsing)
         extracted = extract_info_from_conversation(messages, conversation_id)
         
-        # CRITICAL: Ensure we always have the most recent parsed values
-        # Re-extract if we don't have both date and time, or if values seem stale
-        if not extracted['parsed_date'] or not extracted['parsed_time']:
-            # Try one more time with full conversation context
-            all_user_text = " ".join([
-                msg.get('content', '') for msg in messages 
-                if msg.get('role') == 'user'
-            ])
-            if all_user_text:
-                today = datetime.now(pytz.UTC)
-                if not extracted['parsed_date']:
-                    extracted['parsed_date'] = parse_date_from_text(all_user_text, today)
-                if not extracted['parsed_time'] and extracted['parsed_date']:
-                    parsed_time = parse_time_from_text(all_user_text, extracted['parsed_date'])
-                    if parsed_time:
-                        extracted['parsed_time'] = extracted['parsed_date'].replace(
-                            hour=parsed_time.hour,
-                            minute=parsed_time.minute,
-                            second=0,
-                            microsecond=0
-                        )
-        
         # Replace Vapi's system message with our dynamic one that includes parsed info
         messages = [m for m in messages if m.get('role') != 'system']
         messages = [{'role': 'system', 'content': get_system_prompt(
@@ -645,7 +623,7 @@ def chat():
 
         # Always call Groq non-streaming first so we can inspect the response
         response = groq_client.chat.completions.create(
-            model="meta-llama/llama-4-maverick-17b-128e-instruct",
+            model="openai/gpt-oss-120b",
             messages=messages,
             tools=tools,
             tool_choice="auto",
@@ -672,18 +650,7 @@ def chat():
             if extracted['parsed_date']:
                 if extracted['parsed_time']:
                     # We have both date and time from server parsing - ALWAYS use them
-                    # Ensure parsed_time has the correct date (it should, but double-check)
-                    if extracted['parsed_time'].date() != extracted['parsed_date'].date():
-                        # Fix date mismatch - use parsed_date with parsed_time's time
-                        combined_datetime = extracted['parsed_date'].replace(
-                            hour=extracted['parsed_time'].hour,
-                            minute=extracted['parsed_time'].minute,
-                            second=0,
-                            microsecond=0
-                        )
-                    else:
-                        combined_datetime = extracted['parsed_time']
-                    # CRITICAL: Always override - don't trust LLM's datetime
+                    combined_datetime = extracted['parsed_time']
                     args['datetime'] = combined_datetime.isoformat()
                 else:
                     # We have date but NOT time from server parsing
@@ -703,57 +670,6 @@ def chat():
                         # Cannot parse time - this should not happen if LLM followed instructions
                         # Let create_calendar_event handle the error
                         pass
-            elif extracted['parsed_time']:
-                # We have time but not date - use LLM's date with server-parsed time
-                try:
-                    parsed_from_args = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
-                    combined_datetime = parsed_from_args.replace(
-                        hour=extracted['parsed_time'].hour,
-                        minute=extracted['parsed_time'].minute,
-                        second=0,
-                        microsecond=0
-                    )
-                    args['datetime'] = combined_datetime.isoformat()
-                except:
-                    pass  # If parsing fails, let LLM's value stand
-            else:
-                # No server-parsed values - ALWAYS re-parse from conversation to validate
-                # This catches cases where extraction didn't work but user provided info
-                all_user_text = " ".join([
-                    msg.get('content', '') for msg in messages 
-                    if msg.get('role') == 'user'
-                ])
-                
-                if all_user_text:
-                    # Try to parse date and time from conversation
-                    now = datetime.now(pytz.UTC)
-                    validated_date = parse_date_from_text(all_user_text, now)
-                    validated_time = None
-                    
-                    if validated_date:
-                        validated_time = parse_time_from_text(all_user_text, validated_date)
-                        if validated_time:
-                            # Use validated date/time
-                            validated_time = validated_date.replace(
-                                hour=validated_time.hour,
-                                minute=validated_time.minute,
-                                second=0,
-                                microsecond=0
-                            )
-                            args['datetime'] = validated_time.isoformat()
-                        else:
-                            # Have date but not time - try to get time from LLM's datetime
-                            try:
-                                parsed_from_args = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
-                                combined_datetime = validated_date.replace(
-                                    hour=parsed_from_args.hour,
-                                    minute=parsed_from_args.minute,
-                                    second=0,
-                                    microsecond=0
-                                )
-                                args['datetime'] = combined_datetime.isoformat()
-                            except:
-                                pass
             elif extracted['parsed_time']:
                 # We have time but not date - use LLM's date with server-parsed time
                 try:
