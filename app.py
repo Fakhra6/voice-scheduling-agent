@@ -97,14 +97,7 @@ def get_calendar_service():
     return build('calendar', 'v3', credentials=creds)
 
 
-def create_calendar_event(args):
-    """
-    Creates a Google Calendar event from tool call arguments.
-    Returns a confirmation string or error message.
-    Called directly from /chat/completions when Groq triggers the tool.
-    Why: Vapi's Custom LLM doesn't forward tool calls to server URLs,
-    so we handle everything inside /chat/completions directly.
-    """
+def create_calendar_event(args, messages):
     name = args.get('name', 'Guest')
     datetime_str = args.get('datetime', '')
     title = args.get('title', f'Meeting with {name}')
@@ -116,6 +109,39 @@ def create_calendar_event(args):
 
     if start.tzinfo is None:
         start = start.replace(tzinfo=pytz.UTC)
+
+    # Find the confirmed date from conversation history
+    # Why: LLMs sometimes say one date verbally but pass a different
+    # ISO string to the function. We find the last assistant message
+    # that mentioned a specific date and cross-check against it.
+    confirmed_date = None
+    for msg in reversed(messages):
+        if msg.get('role') == 'assistant':
+            content = msg.get('content', '')
+            # Look for date patterns like "February 23" in the confirmation message
+            import re
+            match = re.search(
+                r'(January|February|March|April|May|June|July|August|'
+                r'September|October|November|December)\s+(\d{1,2})',
+                content
+            )
+            if match:
+                month_str = match.group(1)
+                day = int(match.group(2))
+                month_map = {
+                    'January':1,'February':2,'March':3,'April':4,
+                    'May':5,'June':6,'July':7,'August':8,
+                    'September':9,'October':10,'November':11,'December':12
+                }
+                confirmed_date = (month_map[month_str], day)
+                break
+
+    # If confirmed date doesn't match what Groq passed, correct it
+    if confirmed_date:
+        confirmed_month, confirmed_day = confirmed_date
+        if start.month != confirmed_month or start.day != confirmed_day:
+            # Correct the date to match what was verbally confirmed
+            start = start.replace(month=confirmed_month, day=confirmed_day)
 
     now = datetime.now(pytz.UTC)
     if start < now:
@@ -269,7 +295,7 @@ def chat():
         if message.tool_calls:
             tc = message.tool_calls[0]
             args = json.loads(tc.function.arguments)
-            confirmation = create_calendar_event(args)
+            confirmation = create_calendar_event(args, messages)
 
             if stream:
                 return Response(
