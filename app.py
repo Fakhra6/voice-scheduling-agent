@@ -87,6 +87,7 @@ IMPORTANT RULES:
   the day name you just said? If you said "Monday February 23rd" then 
   the ISO must start with "2026-02-23". Never call the function with 
   a different date than what you confirmed.
+- Make sure you repeat todays date and time in the system prompt so you can calculate relative dates correctly and reject past times on today's date.
 """
 
 
