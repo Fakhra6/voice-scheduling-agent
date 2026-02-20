@@ -45,28 +45,32 @@ def get_calendar_service():
 def extract_info_with_llm(messages):
     """
     Uses LLM to intelligently extract name, date, and time from the conversation.
-    Simple and reliable - lets the LLM understand natural language contextually.
+    Only extracts what the USER explicitly said - never from assistant messages.
     """
     today = datetime.now(pytz.UTC)
     
-    # Build conversation text for extraction
-    conversation_text = "\n".join([
-        f"{msg.get('role', 'user').upper()}: {msg.get('content', '')}"
+    # Only include USER messages for extraction - ignore assistant messages
+    user_messages = "\n".join([
+        msg.get('content', '')
         for msg in messages
-        if msg.get('role') in ['user', 'assistant'] and msg.get('content')
+        if msg.get('role') == 'user' and msg.get('content')
     ])
     
-    extraction_prompt = f"""Today is {today.strftime('%A, %B %d, %Y')} at {today.strftime('%H:%M')} UTC.
+    extraction_prompt = f"""Today is {today.strftime('%A, %B %d, %Y')}.
 
-From this conversation, extract what the USER explicitly stated:
+Extract ONLY what the user explicitly said. Return null for anything not explicitly stated by the user.
 
-{conversation_text}
+USER MESSAGES:
+{user_messages}
 
 Return JSON:
-{{"name": "user's name or null", "date": "YYYY-MM-DD or null", "time": "HH:MM (24h) or null", "title": "meeting title or null"}}
+{{"name": "string or null", "date": "YYYY-MM-DD or null", "time": "HH:MM (24h) or null", "title": "string or null"}}
 
-Convert relative dates (tomorrow, next week, upcoming Monday, etc.) to actual dates. For ambiguous times like "4" in a meeting context, assume PM.
-Only extract what was explicitly stated. Return ONLY valid JSON."""
+Rules:
+- Convert relative dates (tomorrow, upcoming Monday) to actual dates
+- "4 pm" = 16:00, "4" alone with no am/pm = null (don't assume)
+- Only extract if user EXPLICITLY stated it
+- Return ONLY valid JSON, nothing else"""
 
     try:
         response = groq_client.chat.completions.create(
@@ -279,7 +283,14 @@ def chat():
         confirmations = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'sounds good', 'perfect', 'great', 'do it', 'go ahead', 'confirm', 'book it', 'yes please', 'that works', 'correct', 'right', 'absolutely']
         is_confirmation = any(last_user_msg == c or last_user_msg.startswith(c + ' ') or last_user_msg.startswith(c + ',') or last_user_msg.startswith(c + '.') for c in confirmations)
         
-        if is_confirmation and extracted['parsed_time'] and extracted['user_name']:
+        # Only create directly if we have ALL required info: name, date, AND a real time (not midnight)
+        has_valid_time = (
+            extracted['parsed_time'] and 
+            extracted['parsed_date'] and
+            not (extracted['parsed_time'].hour == 0 and extracted['parsed_time'].minute == 0)  # Exclude midnight as likely invalid
+        )
+        
+        if is_confirmation and has_valid_time and extracted['user_name']:
             # Check if already created (prevent duplicates)
             for msg in messages:
                 if msg.get('role') == 'assistant' and "Done! I've created" in msg.get('content', ''):
@@ -383,22 +394,29 @@ def chat():
             tc = message.tool_calls[0]
             args = json.loads(tc.function.arguments)
             
-            # ALWAYS use the LLM-extracted date/time - it's reliable and understands context
-            if extracted['parsed_time']:
-                # We have both date and time from LLM extraction - use them
+            # Only use extracted date/time if it's valid (not midnight which indicates no real time)
+            has_valid_extracted_time = (
+                extracted['parsed_time'] and 
+                extracted['parsed_date'] and
+                not (extracted['parsed_time'].hour == 0 and extracted['parsed_time'].minute == 0)
+            )
+            
+            if has_valid_extracted_time:
                 args['datetime'] = extracted['parsed_time'].isoformat()
             elif extracted['parsed_date']:
-                # We have date but no time - try to get time from the tool call args
+                # We have date but no time - use date with time from tool call args
                 datetime_str = args.get('datetime', '')
                 try:
                     parsed_from_args = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
-                    combined_datetime = extracted['parsed_date'].replace(
-                        hour=parsed_from_args.hour,
-                        minute=parsed_from_args.minute,
-                        second=0,
-                        microsecond=0
-                    )
-                    args['datetime'] = combined_datetime.isoformat()
+                    # Check if tool call has a real time (not midnight)
+                    if parsed_from_args.hour != 0 or parsed_from_args.minute != 0:
+                        combined_datetime = extracted['parsed_date'].replace(
+                            hour=parsed_from_args.hour,
+                            minute=parsed_from_args.minute,
+                            second=0,
+                            microsecond=0
+                        )
+                        args['datetime'] = combined_datetime.isoformat()
                 except:
                     pass
             
