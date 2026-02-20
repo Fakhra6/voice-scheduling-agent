@@ -328,6 +328,26 @@ def chat():
         # CASE 1: Tool call detected
         # Create the calendar event directly here and return confirmation as text
         if message.tool_calls:
+            # Check if event was already created in this conversation (prevent duplicates)
+            for msg in messages:
+                content = msg.get('content', '')
+                if msg.get('role') == 'assistant' and "Done! I've created" in content:
+                    # Event already created - just acknowledge
+                    already_done = "Your event has already been created! Is there anything else I can help you with?"
+                    if stream:
+                        return Response(
+                            stream_text(already_done, response.id),
+                            mimetype='text/event-stream',
+                            headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+                        )
+                    return jsonify({
+                        "id": response.id,
+                        "object": "chat.completion",
+                        "created": int(datetime.now().timestamp()),
+                        "model": response.model,
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": already_done}, "finish_reason": "stop"}]
+                    })
+            
             tc = message.tool_calls[0]
             args = json.loads(tc.function.arguments)
             
