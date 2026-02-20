@@ -7,6 +7,7 @@ from groq import Groq
 import pytz
 import os
 import json
+import re
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -81,13 +82,12 @@ IMPORTANT RULES:
   politely say you can only help with booking calendar events
 - Always say the resolved actual date out loud during confirmation so
   the user can catch any mistakes
-- When calling createCalendarEvent, the datetime ISO string MUST match 
+- When calling createCalendarEvent, the datetime ISO string MUST match
   the exact date you verbally confirmed with the user.
-- Before calling the function, double check: does the ISO date match 
-  the day name you just said? If you said "Monday February 23rd" then 
-  the ISO must start with "2026-02-23". Never call the function with 
+- Before calling the function, double check: does the ISO date match
+  the day name you just said? If you said "Monday February 23rd" then
+  the ISO must start with "2026-02-23". Never call the function with
   a different date than what you confirmed.
-- Make sure you repeat todays date and time in the system prompt so you can calculate relative dates correctly and reject past times on today's date.
 """
 
 
@@ -104,7 +104,65 @@ def get_calendar_service():
     return build('calendar', 'v3', credentials=creds)
 
 
+def extract_confirmed_date(messages):
+    """
+    Scans conversation history in reverse to find the LAST confirmation
+    message from the assistant — the one that says "Just to confirm...".
+    Extracts month and day from that specific message only.
+    
+    Why: Previous code scanned all assistant messages and could pick up
+    dates from earlier steps (like when Tara first calculated the date).
+    The confirmation message is the source of truth — it's what the user
+    agreed to.
+    """
+    month_map = {
+        'January':1,'February':2,'March':3,'April':4,
+        'May':5,'June':6,'July':7,'August':8,
+        'September':9,'October':10,'November':11,'December':12
+    }
+
+    for msg in reversed(messages):
+        if msg.get('role') != 'assistant':
+            continue
+
+        content = msg.get('content', '')
+
+        # Only look at the confirmation message
+        # Why: This is the message the user said "yes" to
+        # It contains the date they actually agreed on
+        is_confirmation = any(phrase in content.lower() for phrase in [
+            'just to confirm',
+            'to confirm',
+            'confirm',
+            'does that sound right',
+            'sound right',
+            'is that correct',
+            'shall i book'
+        ])
+
+        if not is_confirmation:
+            continue
+
+        # Extract month and day from confirmation message
+        match = re.search(
+            r'(January|February|March|April|May|June|July|August|'
+            r'September|October|November|December)\s+(\d{1,2})',
+            content
+        )
+        if match:
+            month_str = match.group(1)
+            day = int(match.group(2))
+            return (month_map[month_str], day)
+
+    return None
+
+
 def create_calendar_event(args, messages):
+    """
+    Creates a Google Calendar event.
+    Validates the datetime against the confirmation message in conversation
+    history to catch and correct LLM date calculation errors.
+    """
     name = args.get('name', 'Guest')
     datetime_str = args.get('datetime', '')
     title = args.get('title', f'Meeting with {name}')
@@ -117,38 +175,20 @@ def create_calendar_event(args, messages):
     if start.tzinfo is None:
         start = start.replace(tzinfo=pytz.UTC)
 
-    # Find the confirmed date from conversation history
-    # Why: LLMs sometimes say one date verbally but pass a different
-    # ISO string to the function. We find the last assistant message
-    # that mentioned a specific date and cross-check against it.
-    confirmed_date = None
-    for msg in reversed(messages):
-        if msg.get('role') == 'assistant':
-            content = msg.get('content', '')
-            # Look for date patterns like "February 23" in the confirmation message
-            import re
-            match = re.search(
-                r'(January|February|March|April|May|June|July|August|'
-                r'September|October|November|December)\s+(\d{1,2})',
-                content
-            )
-            if match:
-                month_str = match.group(1)
-                day = int(match.group(2))
-                month_map = {
-                    'January':1,'February':2,'March':3,'April':4,
-                    'May':5,'June':6,'July':7,'August':8,
-                    'September':9,'October':10,'November':11,'December':12
-                }
-                confirmed_date = (month_map[month_str], day)
-                break
+    # Cross-check against confirmation message
+    # Why: LLMs verbally confirm the correct date but sometimes generate
+    # a wrong ISO string for the function call. The confirmation message
+    # is what the user agreed to — that's the source of truth.
+    confirmed_date = extract_confirmed_date(messages)
 
-    # If confirmed date doesn't match what Groq passed, correct it
     if confirmed_date:
         confirmed_month, confirmed_day = confirmed_date
         if start.month != confirmed_month or start.day != confirmed_day:
-            # Correct the date to match what was verbally confirmed
-            start = start.replace(month=confirmed_month, day=confirmed_day)
+            # Correct silently — user already confirmed the right date
+            try:
+                start = start.replace(month=confirmed_month, day=confirmed_day)
+            except ValueError:
+                pass  # If correction fails, proceed with original
 
     now = datetime.now(pytz.UTC)
     if start < now:
@@ -212,7 +252,6 @@ def stream_text(text, response_id):
         }
         yield f"data: {json.dumps(chunk_data)}\n\n"
 
-    # Final chunk
     done_data = {
         "id": response_id,
         "object": "chat.completion.chunk",
@@ -236,13 +275,13 @@ def chat():
 
     Flow:
     1. Call Groq non-streaming to get full response
-    2. If tool call detected → create calendar event directly here
-       → return confirmation as streamed text to Vapi
-    3. If regular text → stream it to Vapi
-    
+    2. If tool call detected -> create calendar event directly here
+       -> return confirmation as streamed text to Vapi
+    3. If regular text -> stream it to Vapi
+
     Why handle tool calls here instead of /create-event:
     Vapi's Custom LLM provider does not forward tool calls
-    from the LLM response to the tool's server URL (tested previously with multiple attempts and support confirmation).
+    from the LLM response to the tool server URL.
     Everything must be handled inside this endpoint.
     """
     try:
@@ -298,7 +337,6 @@ def chat():
 
         # CASE 1: Tool call detected
         # Create the calendar event directly here and return confirmation as text
-        # Why: Vapi Custom LLM doesn't forward tool calls to server URLs
         if message.tool_calls:
             tc = message.tool_calls[0]
             args = json.loads(tc.function.arguments)
@@ -360,43 +398,6 @@ def chat():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-# @app.route('/create-event', methods=['POST'])
-# def create_event():
-#     """
-#     Kept as backup endpoint.
-#     Primary calendar creation now happens inside /chat/completions.
-#     """
-#     tool_call_id = ''
-#     try:
-#         data = request.json
-#         tool_calls = data.get('message', {}).get('toolCalls', [])
-
-#         if tool_calls:
-#             args = tool_calls[0].get('function', {}).get('arguments', {})
-#             tool_call_id = tool_calls[0].get('id', '')
-#             if isinstance(args, str):
-#                 args = json.loads(args)
-#         else:
-#             args = data
-
-#         confirmation = create_calendar_event(args)
-
-#         return jsonify({
-#             "results": [{
-#                 "toolCallId": tool_call_id,
-#                 "result": confirmation
-#             }]
-#         })
-
-#     except Exception as e:
-#         return jsonify({
-#             "results": [{
-#                 "toolCallId": tool_call_id,
-#                 "result": f"Sorry, there was an error: {str(e)}"
-#             }]
-#         }), 200
 
 
 if __name__ == '__main__':
