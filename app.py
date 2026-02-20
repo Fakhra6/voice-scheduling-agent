@@ -7,10 +7,84 @@ from groq import Groq
 import pytz
 import os
 import json
+from typing import Any, Dict, List
 from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+
+
+def _debug_log(message: str) -> None:
+    if os.getenv('DEBUG_LOG', '').lower() in {'1', 'true', 'yes', 'y'}:
+        print(f"[voice-agent] {message}", flush=True)
+
+
+def _is_affirmative(text: str) -> bool:
+    if not text:
+        return False
+    normalized = ''.join(ch.lower() if ch.isalnum() or ch.isspace() else ' ' for ch in text)
+    normalized = ' '.join(normalized.split())
+    affirmations = {
+        'yes', 'yeah', 'yep', 'yup', 'sure', 'ok', 'okay', 'correct', 'confirm',
+        'confirmed', 'sounds good', 'that works', 'do it', 'please do', 'book it'
+    }
+    return normalized in affirmations
+
+
+def _last_user_message(messages: List[Dict[str, Any]]) -> str:
+    for msg in reversed(messages):
+        if msg.get('role') == 'user':
+            return (msg.get('content') or '').strip()
+    return ''
+
+
+def _extract_event_args_with_groq(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract name/datetime/title from conversation. Returns dict with keys.
+
+    This is a reliability fallback: if the main assistant forgets to emit a tool call
+    after the user confirms, we still produce a tool call payload for Vapi.
+    """
+    extraction_system = (
+        "You are a strict information extraction engine. "
+        "From the conversation, extract meeting details and output ONLY valid JSON. "
+        "Schema: {\"name\": string, \"datetime\": string, \"title\": string}. "
+        "datetime must be ISO 8601 like 2026-02-20T14:00:00 in UTC (no timezone suffix needed). "
+        "If title is missing, set it to \"Meeting with {name}\". "
+        "Do not include extra keys, markdown, or commentary."
+    )
+    extraction_messages = [
+        {"role": "system", "content": extraction_system},
+        {"role": "user", "content": json.dumps(messages)},
+    ]
+
+    resp = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=extraction_messages,
+        temperature=0,
+        max_tokens=200,
+        stream=False,
+    )
+
+    raw = (resp.choices[0].message.content or '').strip()
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Best-effort: try to salvage JSON substring
+    start = raw.find('{')
+    end = raw.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(raw[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    return {}
 
 # Initialize Groq client once at startup
 # Why: Avoids creating a new client on every request
@@ -191,6 +265,7 @@ def chat():
         # Return as complete non-streaming JSON
         # Why: Vapi needs complete tool call JSON to trigger /create-event
         if message.tool_calls:
+            _debug_log("Groq returned tool_calls normally")
             tool_calls = [
                 {
                     "id": tc.id,
@@ -214,9 +289,76 @@ def chat():
                         "message": {
                             "role": "assistant",
                             "content": message.content or "",
-                            "tool_calls": tool_calls
+                            "tool_calls": tool_calls,
+                            "toolCalls": tool_calls
                         },
                         "finish_reason": "tool_calls"
+                    }
+                ]
+            })
+
+        # Reliability fallback:
+        # If the user just confirmed ("yes") but the model returned plain text,
+        # force a tool call by extracting arguments from the conversation.
+        last_user = _last_user_message(messages)
+        if _is_affirmative(last_user):
+            _debug_log("User affirmed, but no tool_calls. Running extraction fallback.")
+            args = _extract_event_args_with_groq(messages)
+            name = (args.get('name') or '').strip()
+            datetime_str = (args.get('datetime') or '').strip()
+            title = (args.get('title') or '').strip()
+            if name and datetime_str:
+                if not title:
+                    title = f"Meeting with {name}"
+                tool_calls = [
+                    {
+                        "id": "call_manual_1",
+                        "type": "function",
+                        "function": {
+                            "name": "createCalendarEvent",
+                            "arguments": json.dumps({
+                                "name": name,
+                                "datetime": datetime_str,
+                                "title": title,
+                            })
+                        }
+                    }
+                ]
+                return jsonify({
+                    "id": response.id,
+                    "object": "chat.completion",
+                    "created": int(datetime.now().timestamp()),
+                    "model": response.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": tool_calls,
+                                "toolCalls": tool_calls
+                            },
+                            "finish_reason": "tool_calls"
+                        }
+                    ]
+                })
+
+            _debug_log(f"Extraction fallback failed: {args}")
+            # If we can't extract reliably, ask for the missing fields.
+            return jsonify({
+                "id": response.id,
+                "object": "chat.completion",
+                "created": int(datetime.now().timestamp()),
+                "model": response.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "I heard your confirmation, but I'm missing a clear name or date/time to book. Could you repeat your full name and the meeting date + time (UTC)?",
+                            "tool_calls": None
+                        },
+                        "finish_reason": "stop"
                     }
                 ]
             })
