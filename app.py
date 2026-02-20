@@ -26,7 +26,7 @@ def get_system_prompt(parsed_date=None, parsed_time=None, user_name=None):
     today = datetime.now(pytz.UTC)
     date_str = today.strftime('%A, %B %d, %Y')
     time_str = today.strftime('%I:%M %p')
-    
+
     # Build context about what we know
     known_info = []
     missing_info = []
@@ -37,7 +37,22 @@ def get_system_prompt(parsed_date=None, parsed_time=None, user_name=None):
         missing_info.append("user's name")
     
     if parsed_date:
-        known_info.append(f"Meeting date: {parsed_date.strftime('%A, %B %d, %Y')} ({parsed_date.strftime('%Y-%m-%d')})")
+        # Format date in a clear, readable way for the LLM to use
+        day_name = parsed_date.strftime('%A')
+        month = parsed_date.strftime('%B')
+        day = parsed_date.strftime('%d').lstrip('0')
+        year = parsed_date.strftime('%Y')
+        # Add ordinal suffix (1st, 2nd, 3rd, etc.)
+        if day.endswith('1') and day != '11':
+            suffix = 'st'
+        elif day.endswith('2') and day != '12':
+            suffix = 'nd'
+        elif day.endswith('3') and day != '13':
+            suffix = 'rd'
+        else:
+            suffix = 'th'
+        formatted_date = f"{day_name}, {month} {day}{suffix}, {year}"
+        known_info.append(f"Meeting date: {formatted_date} ({parsed_date.strftime('%Y-%m-%d')})")
     else:
         missing_info.append("meeting date")
     
@@ -77,17 +92,25 @@ EXTRACTING INFORMATION:
 - Users might provide everything at once or piece by piece - handle both naturally
 
 WHEN YOU HAVE ALL REQUIRED INFO:
-- Read back the details clearly: "Just to confirm, I'll book '[title]' for [name] on [date] at [time] UTC. Does that sound right?"
+- CRITICAL: Always state the EXACT resolved date clearly before asking for confirmation
+- Example: "Got it! So that's Monday, February 23rd, 2026 at 2:00 PM UTC. Just to confirm, I'll book '[title]' for [name] on Monday, February 23rd, 2026 at 2:00 PM UTC. Does that sound right?"
+- Always include both the day name AND the full date (e.g., "Monday, February 23rd, 2026") so the user can verify
 - Wait for explicit confirmation (yes/okay/sounds good/etc.)
 - Only call createCalendarEvent after the user confirms
+- When calling the function, use the EXACT ISO date from EXTRACTED INFORMATION - never recalculate
 
 WHEN INFORMATION IS MISSING:
 - Naturally ask for what's missing without being robotic
 - If the user provides partial info, acknowledge it and ask for the rest naturally
-- Example: User says "Next Monday" → "Got it, next Monday. What time works for you?"
+- Example: User says "Next Monday" → "Got it, next Monday. That would be Monday, February 23rd, 2026. What time works for you?"
 - Example: User says "2pm" but no date → "2pm works! What date should we schedule this for?"
+- Always resolve relative dates to actual dates when acknowledging them
 
 IMPORTANT RULES:
+- CRITICAL: NEVER predict, assume, or guess dates or times
+- ONLY use dates and times that the user has explicitly provided
+- If the user hasn't provided a time, ask for it - DO NOT assume a default time
+- If the user hasn't provided a date, ask for it - DO NOT assume a default date
 - Times are saved in UTC - mention this when relevant
 - Never accept past dates or past times for today
 - If EXTRACTED INFORMATION is provided above, use those EXACT values - don't recalculate
@@ -95,6 +118,7 @@ IMPORTANT RULES:
 - If asked about unrelated topics, politely redirect: "I'm here to help you schedule calendar events. What would you like to book?"
 - When calling createCalendarEvent, use ISO 8601 format: YYYY-MM-DDTHH:MM:SS
 - If you have parsed date/time from EXTRACTED INFORMATION, use those exact values in the function call
+- DO NOT call createCalendarEvent unless you have BOTH date AND time explicitly from the user
 """
 
 
@@ -114,7 +138,7 @@ def get_calendar_service():
 def parse_date_from_text(text, reference_date=None):
     """
     Dynamically parses a date from natural language using dateparser.
-    Handles "next Monday", "tomorrow", etc. using dateparser's NLP.
+    Handles "next Monday", "tomorrow", etc. with explicit calculation for "next [day]" patterns.
     """
     if not text:
         return None
@@ -125,8 +149,37 @@ def parse_date_from_text(text, reference_date=None):
     text_lower = text.lower().strip()
     now = datetime.now(pytz.UTC)
     
-    # Try multiple parsing strategies for better accuracy
-    # Strategy 1: Direct dateparser parse
+    # Strategy 1: Handle "next [day]" patterns explicitly for accuracy
+    # This is dynamic - we detect day names without rigid patterns
+    days_map = {
+        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+        'friday': 4, 'saturday': 5, 'sunday': 6,
+        'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6
+    }
+    
+    # Check for "next [day]" pattern dynamically
+    if 'next' in text_lower:
+        for day_name, day_num in days_map.items():
+            if day_name in text_lower:
+                # Calculate next occurrence of that day
+                current_weekday = reference_date.weekday()
+                days_ahead = day_num - current_weekday
+                
+                if days_ahead <= 0:
+                    # Day already passed this week, go to next week
+                    days_ahead += 7
+                
+                # "next" means add another week
+                days_ahead += 7
+                
+                target_date = reference_date + timedelta(days=days_ahead)
+                result = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                
+                # Validate it's in the future
+                if result.date() >= now.date():
+                    return result
+    
+    # Strategy 2: Use dateparser for other patterns
     parsed = dateparser.parse(
         text,
         settings={
@@ -143,6 +196,24 @@ def parse_date_from_text(text, reference_date=None):
             parsed = pytz.UTC.localize(parsed)
         else:
             parsed = parsed.astimezone(pytz.UTC)
+        
+        # Validate the parsed date makes sense
+        # If dateparser gave us a wrong day of week for "next [day]", recalculate
+        if 'next' in text_lower:
+            for day_name, day_num in days_map.items():
+                if day_name in text_lower:
+                    # Check if parsed date matches the expected day
+                    if parsed.weekday() != day_num:
+                        # dateparser got it wrong, recalculate
+                        current_weekday = reference_date.weekday()
+                        days_ahead = day_num - current_weekday
+                        if days_ahead <= 0:
+                            days_ahead += 7
+                        days_ahead += 7  # "next" means add a week
+                        target_date = reference_date + timedelta(days=days_ahead)
+                        result = target_date.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
+                        if result.date() >= now.date():
+                            return result
         
         # If we got a past date but text suggests future, try again
         if parsed.date() < now.date() and any(word in text_lower for word in ['next', 'tomorrow', 'upcoming']):
@@ -166,8 +237,7 @@ def parse_date_from_text(text, reference_date=None):
         if parsed and parsed.date() >= now.date():
             return parsed
     
-    # Strategy 2: If dateparser failed, try with cleaned text
-    # Remove common filler words that might confuse dateparser
+    # Strategy 3: Try with cleaned text (remove filler words)
     cleaned_text = text_lower
     for word in ['on', 'for', 'the', 'a', 'an']:
         cleaned_text = cleaned_text.replace(f' {word} ', ' ')
@@ -227,7 +297,7 @@ def parse_time_from_text(text, reference_date=None):
             microsecond=0
         )
         return result
-    
+
     return None
 
 
@@ -340,10 +410,15 @@ def create_calendar_event(args, messages):
     """
     Creates a Google Calendar event.
     Uses the datetime from args which should already be corrected by server-side parsing.
+    NEVER assumes or predicts dates/times - only uses what user explicitly provided.
     """
     name = args.get('name', 'Guest')
     datetime_str = args.get('datetime', '')
     title = args.get('title', f'Meeting with {name}')
+
+    # Validation: Ensure we have both date and time
+    if not datetime_str:
+        return "I need both a date and time to create the event. Please provide the time."
 
     try:
         # Handle both with and without timezone
@@ -351,7 +426,7 @@ def create_calendar_event(args, messages):
             datetime_str = datetime_str.replace('Z', '+00:00')
         start = datetime.fromisoformat(datetime_str)
     except ValueError:
-        return "I couldn't parse that date and time. Please try again."
+        return "I couldn't parse that date and time. Please provide a valid date and time."
 
     if start.tzinfo is None:
         start = start.replace(tzinfo=pytz.UTC)
@@ -460,7 +535,7 @@ def chat():
         data = request.json
         messages = data.get('messages', [])
         stream = data.get('stream', False)
-        
+
         # Get or generate conversation ID
         # Vapi might send a user ID or we can use a hash of messages
         conversation_id = data.get('user', None) or str(hash(str(messages[:3])))
@@ -484,8 +559,14 @@ def chat():
                     "description": """Creates a Google Calendar event. 
                     
                     Call this function ONLY after:
-                    1. You have collected the user's name, date, and time
+                    1. You have collected the user's name, date, AND time (all explicitly provided by user)
                     2. The user has explicitly confirmed the details (said yes/okay/sounds good/etc.)
+                    
+                    CRITICAL RULES:
+                    - NEVER assume, predict, or guess dates or times
+                    - ONLY use dates/times the user explicitly provided
+                    - If user hasn't given a time, ask for it - DO NOT call this function
+                    - If user hasn't given a date, ask for it - DO NOT call this function
                     
                     Extract information naturally from the conversation - users may provide it in any order.
                     If you have parsed date/time from the EXTRACTED INFORMATION section, use those exact values.
@@ -537,27 +618,30 @@ def chat():
             datetime_str = args.get('datetime', '')
             
             # Priority 1: Use server-parsed date/time (most reliable - prevents hallucinations)
+            # CRITICAL: Never assume or predict times - only use what user explicitly provided
             if extracted['parsed_date']:
                 if extracted['parsed_time']:
                     # We have both date and time from server parsing - ALWAYS use them
                     combined_datetime = extracted['parsed_time']
+                    args['datetime'] = combined_datetime.isoformat()
                 else:
-                    # We have date but not time - extract time from LLM's datetime
+                    # We have date but NOT time from server parsing
+                    # Check if LLM extracted time from user input (not assumed)
                     try:
                         parsed_from_args = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
                         # Use server-parsed date with LLM-extracted time
+                        # The LLM should only provide times the user explicitly mentioned
                         combined_datetime = extracted['parsed_date'].replace(
                             hour=parsed_from_args.hour,
                             minute=parsed_from_args.minute,
                             second=0,
                             microsecond=0
                         )
+                        args['datetime'] = combined_datetime.isoformat()
                     except:
-                        # Fallback: use parsed date at 2 PM
-                        combined_datetime = extracted['parsed_date'].replace(hour=14, minute=0, second=0, microsecond=0)
-                
-                # ALWAYS override with server-parsed date to prevent hallucinations
-                args['datetime'] = combined_datetime.isoformat()
+                        # Cannot parse time - this should not happen if LLM followed instructions
+                        # Let create_calendar_event handle the error
+                        pass
             elif extracted['parsed_time']:
                 # We have time but not date - use LLM's date with server-parsed time
                 try:
