@@ -6,17 +6,30 @@ natural conversation. Built with Vapi.ai, Groq (Llama 3.3 70B versatile), Python
 ---
 
 
-
 ## Architecture
-```mermaid
+
 graph TD
-    A[User speaks] --> B[Vapi (speech-to-text)]
-    B --> C[Flask /chat endpoint<br/>(injects today's date into system prompt)]
-    C --> D[Groq — Llama 3.3 70B<br/>(understands conversation, collects details)]
-    D --> E[User confirms → Vapi calls Flask /create-event]
-    E --> F[Google Calendar API creates the event]
-    F --> G[Vapi speaks confirmation to user]
-```
+    A[User Speaks] -->|Audio| B(Vapi: Speech-to-Text)
+    B -->|Text Transcript| C{Flask Endpoint}
+    
+    subgraph Logic Layer
+    C -->|Inject Context: Date/Time| D[Groq: Llama 3.3 70B]
+    D -->|Analyze & Extract| E[Name, Date, Time, Title]
+    end
+
+    E --> F{User Confirms?}
+    F -->|No| D
+    F -->|Yes| G[Groq Triggers Tool Call]
+
+    G --> H[Flask: Google Calendar API]
+    H --> I[Event Created]
+    I --> J[Flask Returns Text Confirmation]
+    J --> K(Vapi: Text-to-Speech)
+    K -->|Audio| L[User Hears Confirmation]
+
+    style D fill:#f9f,stroke:#333,stroke-width:2px
+    style H fill:#4285F4,color:#fff
+
 
 ---
 
@@ -31,7 +44,6 @@ graph TD
 | Railway | Backend hosting — always-on, no cold starts |
 
 ---
-
 
 
 
