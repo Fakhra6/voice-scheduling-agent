@@ -623,7 +623,7 @@ def chat():
 
         # Always call Groq non-streaming first so we can inspect the response
         response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.3-70b",
             messages=messages,
             tools=tools,
             tool_choice="auto",
